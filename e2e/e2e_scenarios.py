@@ -173,6 +173,30 @@ def sc_toobig():
     check("J over-limit: process still alive", p.poll() is None)
     check("J over-limit: local file kept", len(M.read_text())==len(big))
 
+def proc_stats(pid):
+    st=open(f"/proc/{pid}/status").read()
+    rss=int(re.search(r"VmRSS:\s+(\d+)",st).group(1))//1024; thr=int(re.search(r"Threads:\s+(\d+)",st).group(1))
+    return rss,thr,len(os.listdir(f"/proc/{pid}/fd"))
+
+def sc_soak():
+    """K: 5 minutes of low-rate edits from both sides; resources must stay flat, nothing lost."""
+    r=random.Random(11); toks=[]; samples=[]; end=time.time()+300; n=0; nxt=0
+    while time.time()<end:
+        n+=1; tok=f"<<SOAK{RUN}-{n}>>"
+        if r.random()<0.5:
+            cur=M.read_text(); pos=lb(r,cur); tmp=OUT/".x.swp"; tmp.write_text(cur[:pos]+tok+"\n"+cur[pos:]); os.replace(tmp,M)
+        else:
+            R.insert_line("main.tex",r,tok)
+        toks.append(tok)
+        if time.time()>nxt: samples.append((int(end-time.time()),)+proc_stats(p.pid)); nxt=time.time()+30
+        time.sleep(r.uniform(0.5,3))
+    check("K soak: converged", converged(t=60))
+    srv=R.content("main.tex")[0]
+    check("K soak: every token exactly once", all(srv.count(t)==1 for t in toks), f"{len(toks)} edits")
+    print("   (secs_left, RSS MB, threads, fds):",samples)
+    check("K soak: memory growth < 50MB", samples[-1][1]-samples[0][1]<50)
+    check("K soak: threads/fds flat", samples[-1][2]<=samples[0][2]+2 and samples[-1][3]<=samples[0][3]+5)
+
 def sc_pause():
     """E: server paused / restarted with local edits pending."""
     cur=M.read_text(); ssh(f"{PODMAN} pause sharelatex"); time.sleep(2)
@@ -229,7 +253,7 @@ def sc_unsafe_name():
     time.sleep(8)
     check("I nothing written outside out dir", not Path("/tmp/olt/evil.tex").exists() and not Path("/tmp/evil.tex").exists())
 
-SC={"A":sc_random,"B":sc_editors,"C":sc_delete_recreate,"G":sc_symlink,"D":sc_big,"H":sc_structure,"I":sc_unsafe_name,"J":sc_toobig,"E":sc_pause,"F":sc_restart}
+SC={"A":sc_random,"B":sc_editors,"C":sc_delete_recreate,"G":sc_symlink,"D":sc_big,"H":sc_structure,"I":sc_unsafe_name,"J":sc_toobig,"K":sc_soak,"E":sc_pause,"F":sc_restart}
 for name in sys.argv[1:] or SC:
     print(f"=== {name}",flush=True)
     try:
