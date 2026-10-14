@@ -103,3 +103,42 @@ def test_backup_of_local_file_overwritten_by_initial_sync(tmp_path):
     sync._backup_local("sub/main.tex", "my offline edits")
     saved = list((tmp_path / ".overleaf-sync-backup").rglob("main.tex"))
     assert [p.read_text() for p in saved] == ["my offline edits"]
+
+
+def test_atomic_write_replaces_without_leftovers(tmp_path):
+    p = tmp_path / "a.tex"
+    p.write_text("old")
+    overleaf_sync.atomic_write(p, "new")
+    assert p.read_text() == "new"
+    assert [f.name for f in tmp_path.iterdir()] == ["a.tex"]
+
+
+def test_untracked_local_file_is_warned_not_uploaded(tmp_path, capsys):
+    sync = _sync(tmp_path)
+    (tmp_path / "main.tex").write_text("x")
+    (tmp_path / "new.tex").write_text("y")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("z")
+    sync._warn_untracked()
+    out = capsys.readouterr().out
+    assert "new.tex is not an Overleaf document" in out
+    assert "main.tex" not in out and ".git" not in out
+
+
+def test_dry_run_never_pushes(tmp_path):
+    import threading
+    sync = _sync(tmp_path, "hello")
+    sync.dry_run = True
+    sync.POLL_INTERVAL = 0.02
+    sync._running = True
+    sync._ws_ready.set()
+    sync._ws_ready_at = -100
+    (tmp_path / "main.tex").write_text("hello world")
+    sync._push_change = lambda *a: pytest.fail("pushed in dry-run")
+    t = threading.Thread(target=sync._watch_files, daemon=True)
+    t.start()
+    import time; time.sleep(0.3)
+    sync._running = False
+    t.join(timeout=2)
+    assert sync._docs["d1"]["content"] == "hello"
+

@@ -24,7 +24,7 @@ Not yet covered: folder operations.
 ## Usage
 
 ```bash
-pip install requests websocket-client
+pip install -r requirements.txt
 
 python3 overleaf_sync.py <project_id>
 ```
@@ -47,6 +47,10 @@ While a coauthor types, their ops are merged into the local file, never written 
 - ❌ `joinDoc` timeouts/errors raise instead of looking like an empty doc (which would be merged as "server deleted everything").
 - 🔀 A version gap in incoming updates, or an exception in the update handler, drops the socket; the reconnect path re-joins and 3-way merges instead of pushing from a stale copy.
 - 💾 At startup, a local file that differs from Overleaf is copied to `<dir>/.overleaf-sync-backup/<timestamp>/` before being overwritten.
+- 📝 Local writes are atomic (temp file + rename) and the merge re-reads the file right before replacing it, so an editor save in between is not lost.
+- 🌲 When a doc is added, renamed, moved or removed in Overleaf, the sync reconnects to rebuild the doc tree; docs removed upstream stop syncing (local copy untouched). Events used: `reciveNewDoc`, `reciveEntityRename`, `reciveEntityMove`, `removeEntity` (names as in Overleaf's realtime server; not yet verified against a live project).
+- ⚠️ Local files that are not Overleaf docs are never uploaded; a warning is printed.
+- 🧪 `--dry-run`: pulls from Overleaf but never sends; logs what would be pushed. Use it first on a real project.
 - Overleaf itself rejects a delete whose text does not match the document, and keeps full history (restore from Overleaf's History if needed).
 
 ## Reconnect invariants (data-loss prevention)

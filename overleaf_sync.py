@@ -615,6 +615,17 @@ def collect_docs_from_project(project_data: dict) -> dict[str, str]:
 import time as _time
 
 
+def atomic_write(path: Path, text: str) -> None:
+    """Write via temp file + rename so readers never see a truncated file."""
+    tmp = path.with_name(f".{path.name}.sync-tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        shutil.copymode(path, tmp)
+    except FileNotFoundError:
+        pass
+    os.replace(tmp, path)
+
+
 def _ts() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
@@ -738,10 +749,15 @@ class OverleafSync:
 
     POLL_INTERVAL = 0.5  # seconds between local file checks
 
-    def __init__(self, project_id: str, session_cookie: str, output_dir: str):
+    def __init__(self, project_id: str, session_cookie: str, output_dir: str,
+                 dry_run: bool = False):
         self.project_id = project_id
         self.session_cookie = session_cookie
         self.output_dir = Path(output_dir)
+        # dry_run: never send anything to Overleaf; only log what would be sent.
+        self.dry_run = dry_run
+        self._warned: set[str] = set()
+        self._last_untracked_scan = 0.0
 
         self._lock = threading.Lock()
         # doc_id → {content, version, path}
@@ -824,17 +840,28 @@ class OverleafSync:
 
             out_path = self.output_dir / state["path"]
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                local = out_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                local = old_content
-            if local == old_content:
-                merged, note = state["content"], ""
+            # An editor may save between our read and our replace; re-read
+            # right before replacing and redo the merge if the file moved.
+            for _ in range(10):
+                try:
+                    local = out_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    local = old_content
+                if local == old_content:
+                    merged, note = state["content"], ""
+                else:
+                    local_ops = compute_ot_ops(old_content, local)
+                    _, remote_t = transform_x(local_ops, remote)
+                    merged, note = apply_sharejs_ops(local, remote_t), ", merged with local edits"
+                try:
+                    unchanged = out_path.read_text(encoding="utf-8") == local
+                except FileNotFoundError:
+                    unchanged = local == old_content
+                if unchanged:
+                    break
             else:
-                local_ops = compute_ot_ops(old_content, local)
-                _, remote_t = transform_x(local_ops, remote)
-                merged, note = apply_sharejs_ops(local, remote_t), ", merged with local edits"
-            out_path.write_text(merged, encoding="utf-8")
+                raise RuntimeError(f"{state['path']} kept changing while merging")
+            atomic_write(out_path, merged)
             label = (state["path"], state["version"], _ops_summary(ops) + note)
 
         print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
@@ -883,7 +910,15 @@ class OverleafSync:
                 _time.sleep(SETTLE_SECS - age)
                 continue
             try:
+                self._warn_untracked()
                 for doc_id, old, new in self._settled(self._collect_local_changes()):
+                    if self.dry_run:
+                        self._warn_once(
+                            f"dry:{doc_id}:{hash(new)}",
+                            f"[dry-run] would push {self._docs[doc_id]['path']} "
+                            f"({_ops_summary(compute_ot_ops(old, new))}); nothing sent",
+                        )
+                        continue
                     self._push_change(doc_id, old, new)
             except Exception as e:
                 print(f"  {_ts()} [sync] poll error: {e}", flush=True)
@@ -928,6 +963,32 @@ class OverleafSync:
                 del self._candidates[doc_id]
         return ready
 
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            print(f"  {_ts()} [sync] {msg}", flush=True)
+
+    def _warn_untracked(self) -> None:
+        """Local files that are not Overleaf docs are never uploaded; say so."""
+        now = _time.monotonic()
+        if now - self._last_untracked_scan < 5.0:
+            return
+        self._last_untracked_scan = now
+        with self._lock:
+            tracked = {s["path"] for s in self._docs.values()}
+        for p in self.output_dir.rglob("*"):
+            if not p.is_file() or p.name.endswith(".sync-tmp"):
+                continue
+            rel = p.relative_to(self.output_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue  # backups, .git, editor temp files
+            if rel.as_posix() not in tracked:
+                self._warn_once(
+                    f"untracked:{rel}",
+                    f"{rel} is not an Overleaf document and will NOT be uploaded "
+                    f"(create it in Overleaf, then restart or wait for the tree refresh)",
+                )
+
     def _dir_inode(self) -> int | None:
         try:
             return self.output_dir.stat().st_ino
@@ -955,7 +1016,7 @@ class OverleafSync:
                     continue
                 sanitized = sanitize_non_bmp(fc)
                 if sanitized != fc:
-                    out_path.write_text(sanitized, encoding="utf-8")
+                    atomic_write(out_path, sanitized)
                     print(
                         f"  {_ts()} [sync] {state['path']}: Overleaf cannot store chars outside "
                         f"the BMP (e.g. emoji); replaced them with U+FFFD U+FFFD locally",
@@ -1047,7 +1108,7 @@ class OverleafSync:
                 local = state["content"]
             state["content"] = server_content
             state["version"] = new_v
-            out_path.write_text(merge3(base, local, server_content), encoding="utf-8")
+            atomic_write(out_path, merge3(base, local, server_content))
         print(f"  [sync] re-synced to server v{new_v}, local edits kept", flush=True)
 
     def _disconnect_ws(self):
@@ -1076,6 +1137,16 @@ class OverleafSync:
         ws = TrackingSocketIOClient(session, self.project_id)
         ws.on("otUpdateApplied", self._on_ot_update)
         ws.on_handler_error = lambda name, exc: self._force_reconnect(ws)
+
+        def on_tree_change(args, _name=None):
+            # Added / renamed / moved / removed entity: re-join the project so
+            # the doc tree is rebuilt (the reconnect path merges safely).
+            print(f"  {_ts()} [sync] project tree changed; refreshing", flush=True)
+            self._force_reconnect(ws)
+
+        for ev in ("reciveNewDoc", "reciveNewFile", "reciveNewFolder",
+                   "reciveEntityRename", "reciveEntityMove", "removeEntity"):
+            ws.on(ev, on_tree_change)
         ws.connect()
         ws.run_forever()
         try:
@@ -1109,6 +1180,12 @@ class OverleafSync:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        with self._lock:
+            for gone in [d for d in self._docs if d not in docs]:
+                path = self._docs.pop(gone)["path"]
+                print(f"  {_ts()} [sync] {path} no longer exists in Overleaf; "
+                      f"no longer syncing it (local copy left untouched)", flush=True)
+
         for doc_id, pathname in sorted(docs.items(), key=lambda x: x[1]):
             lines, version = ws.join_doc(doc_id)
             server_content = "\n".join(lines)
@@ -1136,7 +1213,7 @@ class OverleafSync:
                         # Local file is stale — identical to the last synced state
                         # before the disconnect.  Overwrite with the latest server
                         # content; do NOT push old content to Overleaf.
-                        out_path.write_text(server_content, encoding="utf-8")
+                        atomic_write(out_path, server_content)
                         print(f"  {_ts()} [sync] stale local {pathname} → updated to v{version}", flush=True)
                     else:
                         # Local has genuine edits relative to the pre-disconnect
@@ -1146,7 +1223,7 @@ class OverleafSync:
                         merged = merge3(merge_base or "", local_content, server_content)
                         # Keep in-memory state = server_content so the poll loop
                         # will diff (server → merged) and push to Overleaf.
-                        out_path.write_text(merged, encoding="utf-8")
+                        atomic_write(out_path, merged)
                         print(f"  {_ts()} [sync] merged local edits for {pathname}", flush=True)
                     continue
             if initial and out_path.exists():
@@ -1156,7 +1233,7 @@ class OverleafSync:
                     previous = None
                 if previous is not None and previous != server_content:
                     self._backup_local(pathname, previous)
-            out_path.write_text(server_content, encoding="utf-8")
+            atomic_write(out_path, server_content)
             if initial:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
 
@@ -1245,6 +1322,8 @@ def main():
                         help="Path to a specific Firefox cookies.sqlite database")
     parser.add_argument("--listen", action="store_true",
                         help="Passive mode: Overleaf → local folder, read-only")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Sync Overleaf → local but never send local edits; log what would be sent")
     parser.add_argument("--output-dir", default=None,
                         help="Local folder (default: current working directory)")
 
@@ -1290,6 +1369,7 @@ def main():
             project_id=args.project_id,
             session_cookie=session_cookie,
             output_dir=args.output_dir,
+            dry_run=args.dry_run,
         ).run()
 
 
