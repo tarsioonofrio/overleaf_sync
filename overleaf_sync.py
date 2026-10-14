@@ -198,7 +198,12 @@ def load_overleaf_cookie(
         tmp_dir = Path(tempfile.mkdtemp(prefix="overleaf-cookie-"))
         tmp_db = tmp_dir / "cookies.sqlite"
         try:
-            shutil.copy2(db_path, tmp_db)
+            # Firefox keeps recent cookies in the write-ahead log: copying only
+            # cookies.sqlite would read a stale (often expired) session.
+            for suffix in ("", "-wal", "-shm"):
+                src = db_path.with_name(db_path.name + suffix)
+                if src.exists():
+                    shutil.copy2(src, tmp_dir / ("cookies.sqlite" + suffix))
             with sqlite3.connect(tmp_db) as conn:
                 row = conn.execute(
                     """

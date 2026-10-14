@@ -297,3 +297,22 @@ def test_session_cookie_is_sent_to_localhost():
         assert "overleaf.sid=s%3Aabc" in req.headers.get("Cookie", "")
     finally:
         overleaf_cli.configure()
+
+
+def test_firefox_cookie_in_the_wal_file_is_read(tmp_path, monkeypatch):
+    """Recent cookies live in cookies.sqlite-wal until Firefox checkpoints; they must not be missed."""
+    import sqlite3
+    db = tmp_path / "cookies.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)")
+    con.execute("INSERT INTO moz_cookies VALUES ('overleaf_session2', 'OLD', '.overleaf.com', 1)")
+    con.commit(); con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.execute("UPDATE moz_cookies SET value='FRESH', lastAccessed=2")
+    con.commit()                                   # now only in the -wal file
+    assert (tmp_path / "cookies.sqlite-wal").stat().st_size > 0
+    monkeypatch.delenv("OVERLEAF_COOKIE", raising=False)
+    got = overleaf_sync.load_overleaf_cookie(cookie_db=str(db), url="https://www.overleaf.com", cookie_name="overleaf_session2")
+    con.close()
+    assert got == "FRESH"
