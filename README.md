@@ -31,6 +31,15 @@ python3 overleaf_sync.py <project_id>
 
 Get `overleaf_session2` from your browser cookies while logged in to overleaf.com. Get `project_id` from the URL (`/project/<id>`).
 
+### Install and run as a service
+
+```bash
+pipx install .            # or: pip install .   → provides the `overleaf-sync` command
+overleaf-sync --check <project_id>
+```
+
+`contrib/overleaf-sync@.service` is a systemd *user* unit (one instance per project; the cookie goes in a `chmod 600` env file, see the comments in the file). Tests run on Python 3.11–3.14 in CI (`.github/workflows/test.yml`).
+
 ## Live concurrent editing
 
 While a coauthor types, their ops are merged into the local file, never written over it (`test_concurrent_edits.py`):

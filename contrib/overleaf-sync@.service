@@ -1,0 +1,21 @@
+# User unit: one instance per project.
+#   cp contrib/overleaf-sync@.service ~/.config/systemd/user/
+#   mkdir -p ~/.config/overleaf-sync && echo 'OVERLEAF_COOKIE=...' > ~/.config/overleaf-sync/env && chmod 600 ~/.config/overleaf-sync/env
+#   systemctl --user enable --now overleaf-sync@<project-id>
+# The project is synced into ~/overleaf/<project-id>. Add OVERLEAF_URL / OVERLEAF_COOKIE_NAME to the env file for Overleaf CE.
+[Unit]
+Description=Overleaf two-way sync for project %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/overleaf-sync/env
+ExecStart=%h/.local/bin/overleaf-sync %i --output-dir %h/overleaf/%i
+Restart=on-failure
+RestartSec=30
+# a failed login or an unsupported protocol exits non-zero on purpose; do not hammer the server
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
