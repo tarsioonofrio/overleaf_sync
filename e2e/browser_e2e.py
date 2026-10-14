@@ -115,6 +115,13 @@ class Browser:
         """Real keystrokes at document offset pos."""
         self.js("view.focus(); view.dispatch({selection:{anchor:arguments[0]},scrollIntoView:true})", pos)
         ActionChains(self.d).send_keys(text).perform()
+    def insert_at_random_line(self, lo, hi, r, text):
+        """Pick a line start in [lo, hi) of the document (fractions) and insert there in ONE script, so a merge
+        cannot shift the text between choosing the position and inserting (that would split other tokens)."""
+        self.js("const t=view.state.doc.toString(),a=[0];for(let i=0;i<t.length;i++)if(t[i]=='\\n')a.push(i+1);"
+                "const n=a.length,L=Math.floor(n*arguments[0]),H=Math.max(L+1,Math.floor(n*arguments[1]));"
+                "view.dispatch({changes:{from:a[Math.min(n-1,L+Math.floor(arguments[2]*(H-L)))],insert:arguments[3]}})",
+                lo, hi, r, text)
     def insert_at(self, pos, text):
         """One atomic CodeMirror transaction at pos (what a paste does)."""
         self.js("view.dispatch({changes:{from:arguments[0],insert:arguments[1]}})", pos, text)
@@ -162,14 +169,22 @@ def local_insert_line(path, tok, r, style):
 class Ctx:
     pass
 
-def converge(ctx, t=40):
-    """browser == local == server."""
-    def same():
+def converge(ctx, t=40, stable=4.0):
+    """browser == local == server, and still the same text `stable` seconds later (three separate reads can
+    coincide for an instant in the middle of a merge, which is not convergence)."""
+    end = time.time() + t; since = None; last = None
+    while time.time() < end:
         a, b, c = ctx.browser.text(), ctx.local.read_text(), ctx.server.text()
-        return a == b == c
-    good = wait(same, t)
+        if a == b == c:
+            if since is None or a != last:
+                since, last = time.time(), a
+            elif time.time() - since >= stable:
+                return True, (len(a), len(b), len(c))
+        else:
+            since = None
+        time.sleep(0.5)
     a, b, c = ctx.browser.text(), ctx.local.read_text(), ctx.server.text()
-    return good, (len(a), len(b), len(c))
+    return a == b == c, (len(a), len(b), len(c))
 
 def all_once(text, toks):
     return [t for t in toks if text.count(t) != 1]
@@ -308,11 +323,11 @@ def BR9(ctx):
         n = 0
         while time.time() < end:
             n += 1; tok = f"<<BR9b-{RUN}-{n}>>"
-            starts = ctx.browser.line_starts()
             if n % 2:
+                starts = ctx.browser.line_starts()
                 ctx.browser.type_at(r_br.choice(starts[: len(starts) // 2]), tok + "\n")
             else:
-                ctx.browser.insert_at(r_br.choice(starts[: len(starts) // 2]), tok + "\n")
+                ctx.browser.insert_at_random_line(0, 0.5, r_br.random(), tok + "\n")
             btoks.append(tok); time.sleep(r_br.uniform(0.02, 0.15))
     def local_side():
         n = 0
@@ -338,7 +353,7 @@ def BR10(ctx):
     text the sync merged in that instant.  Checked: views converge, nothing is duplicated, and every lost edit is
     recoverable from the deletion record.  The loss rate is reported, not gated."""
     r_loc, r_br = random.Random(11), random.Random(12)
-    btoks, ltoks = [], []; end = time.time() + 30
+    btoks, ltoks = [], []; end = time.time() + 30; when = {}
     def stale_writer():
         n = 0
         while time.time() < end:
@@ -350,13 +365,12 @@ def BR10(ctx):
                 with open(ctx.local, "w") as f: f.write(new)
             else:
                 tmp = ctx.local.with_name(".swp"); tmp.write_text(new); os.replace(tmp, ctx.local)
-            ltoks.append(tok); time.sleep(r_loc.uniform(0.05, 0.2))
+            ltoks.append(tok); when[tok] = time.time(); time.sleep(r_loc.uniform(0.05, 0.2))
     def browser_side():
         n = 0
         while time.time() < end:
             n += 1; tok = f"<<BR10b-{RUN}-{n}>>"
-            starts = ctx.browser.line_starts()
-            ctx.browser.insert_at(r_br.choice(starts[: len(starts) // 2]), tok + "\n"); btoks.append(tok)
+            ctx.browser.insert_at_random_line(0, 0.5, r_br.random(), tok + "\n"); btoks.append(tok); when[tok] = time.time()
             time.sleep(r_br.uniform(0.02, 0.1))
     ts = [threading.Thread(target=stale_writer), threading.Thread(target=browser_side)]
     [t.start() for t in ts]; [t.join() for t in ts]
@@ -368,6 +382,14 @@ def BR10(ctx):
     snaps = "".join(p.read_text() for p in (ctx.local.parent / ".overleaf-sync-backup").rglob("deleted.jsonl"))
     unrecoverable = [t for t in lost if t not in snaps]
     print("   unrecoverable:", [t.split("-", 2)[2] for t in unrecoverable][:12], "work dir:", ctx.local.parent.parent)
+    for t in unrecoverable:
+        print("     ", t, "side", "local" if "BR10l" in t else "browser", "inserted at", time.strftime("%H:%M:%S", time.localtime(when.get(t, 0))) + f".{int((when.get(t, 0) % 1) * 1000):03d}")
+    if unrecoverable:        # where are they, right now and a bit later?
+        def where():
+            bt, lt, st = ctx.browser.text(), ctx.local.read_text(), ctx.server.text()
+            return {t.split("-", 2)[2]: "".join(k for k, x in (("B", bt), ("L", lt), ("S", st)) if t in x) or "-" for t in unrecoverable}
+        print("   at check time (server text used by the check had none of them):", where(), flush=True)
+        time.sleep(8); print("   8 s later:", where(), flush=True)
     check("BR10 every lost edit is recoverable from the deletion record", not unrecoverable,
           f"{len(lost)} of {len(btoks) + len(ltoks)} edits overwritten by stale saves; unrecoverable={len(unrecoverable)}")
 

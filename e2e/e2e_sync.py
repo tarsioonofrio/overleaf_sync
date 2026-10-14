@@ -82,11 +82,12 @@ check("5 sentinel consumed", not (OUT/".overleaf-sync-confirm-wipe").exists())
 M.write_text(good); wait(lambda:R.content("main.tex")[0]==good,15)
 # 6 edits on both sides while stopped are merged on restart
 p.terminate(); p.wait(); time.sleep(1)
+c0=(good.count("OFFLINE LOCAL"), good.count("OFFLINE REMOTE"))     # leftovers of earlier runs
 M.write_text(good+"%% OFFLINE LOCAL\n"); sc=R.content("main.tex")[0]; R.edit("main.tex","%% OFFLINE REMOTE\n"+sc)
 n0=len(logtxt()); p=start_sync(); wait(lambda:"Bidirectional sync active" in logtxt()[n0:],40)
 both=lambda t:"%% OFFLINE LOCAL" in t and "%% OFFLINE REMOTE" in t
 check("6 both offline edits reach the server", wait(lambda:both(R.content("main.tex")[0]),30))
-check("6 local == server, each edit once", wait(lambda:M.read_text()==R.content("main.tex")[0],20) and M.read_text().count("OFFLINE LOCAL")==1 and M.read_text().count("OFFLINE REMOTE")==1)
+check("6 local == server, each edit once", wait(lambda:M.read_text()==R.content("main.tex")[0],20) and M.read_text().count("OFFLINE LOCAL")==c0[0]+1 and M.read_text().count("OFFLINE REMOTE")==c0[1]+1)
 bk=list(OUT.glob(".overleaf-sync-backup/*/main.tex"))
 check("6 pre-merge local file kept in backup", any("OFFLINE LOCAL" in b.read_text() for b in bk))
 # 7 new doc created in Overleaf

@@ -27,6 +27,7 @@ import configparser
 import datetime
 import difflib
 import json
+import shlex
 import os
 import re
 import shutil
@@ -476,15 +477,21 @@ def wire_to_cp(content: str, ops: list[dict]) -> list[dict]:
     if not isinstance(ops, list):
         raise ValueError(f"ops is not a list: {type(ops).__name__}")
     out = []
+    u16 = lambda t: len(t.encode("utf-16-le", "surrogatepass")) // 2
+    n16 = len(content) if content.isascii() else u16(content)       # document length in UTF-16 units
     for op in ops:
         if not isinstance(op, dict):
             raise ValueError("op is not an object")
         p16 = op.get("p")
-        if type(p16) is not int or not 0 <= p16 <= len(content.encode("utf-16-le", "surrogatepass")) // 2:
+        if type(p16) is not int or not 0 <= p16 <= n16:
             raise ValueError(f"bad op position {p16!r}")
         cp_op = {**op, "p": _utf16_to_cp(content, p16)}
         out.append(cp_op)
         content = apply_ops_strict(content, [cp_op])
+        if isinstance(cp_op.get("i"), str):
+            n16 += u16(cp_op["i"])
+        elif isinstance(cp_op.get("d"), str):
+            n16 -= u16(cp_op["d"])
     return out
 
 
@@ -708,7 +715,8 @@ def is_safe_relpath(rel: str) -> bool:
     parts = rel.split("/")
     if any(p in ("", ".", "..") for p in parts):
         return False
-    if any(p.startswith(".overleaf-sync-backup") or p.endswith(".sync-tmp") for p in parts):
+    # our own files: backups, merge bases, wipe confirmation, lock, temp files
+    if any(p.startswith(".overleaf-sync") or p.endswith(".sync-tmp") for p in parts):
         return False
     return len(rel.encode("utf-8", "surrogatepass")) < 4096 and all(
         len(p.encode("utf-8", "surrogatepass")) <= 255 for p in parts
@@ -994,6 +1002,10 @@ class OverleafSync:
         # allow_wipe: push a file that was emptied locally without asking first.
         self.allow_wipe = allow_wipe
         self._wipe_ok: set[str] = set()          # docs whose wipe the user confirmed
+        self._wipe_warned_at: dict[str, float] = {}   # doc_id → wall time of the "NOT sending" warning
+        self._recorded: set[tuple] = set()       # (doc, old, new) whose deletions are already in deleted.jsonl
+        self._base_project_written = False
+        self._poll_error_at: dict[str, float] = {}
         self._base_saved: dict[str, str] = {}    # doc_id → last base written to disk
         self._warned: set[str] = set()
         self._last_untracked_scan = 0.0
@@ -1080,6 +1092,7 @@ class OverleafSync:
             # server text and push the coauthor's edit as a deletion.
             before = (state["content"], state["version"],
                       (list(inflight["ops"]), inflight["base"]) if inflight else None)
+            wipe_cancelled: list[bool] = []
             try:
                 base = inflight["base"] if inflight else state["content"]
                 remote = wire_to_cp(base, ops)
@@ -1096,6 +1109,9 @@ class OverleafSync:
                 def merge_remote(local: str) -> str:
                     if local == old_content:
                         return state["content"]
+                    if not self.allow_wipe and self._is_wipe(old_content, local):
+                        wipe_cancelled.append(True)       # do not leave a fragment of the update in an emptied file
+                        return state["content"]
                     local_ops = compute_ot_ops(old_content, local)
                     _, remote_t = transform_x(local_ops, remote)
                     return apply_sharejs_ops(local, remote_t)
@@ -1107,6 +1123,10 @@ class OverleafSync:
                     inflight["ops"], inflight["base"] = before[2]
                 raise
             note = "" if seen == old_content else ", merged with local edits"
+            if wipe_cancelled:
+                note = ", pending empty-file wipe cancelled by this edit"
+                self._warned.discard(f"wipe:{doc_id}")
+                self._wipe_warned_at.pop(doc_id, None)
             label = (state["path"], state["version"], _ops_summary(ops) + note)
 
         print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
@@ -1194,7 +1214,11 @@ class OverleafSync:
                         continue
                     self._push_change(doc_id, old, new)
             except Exception as e:
-                self._warn_once(f"poll:{type(e).__name__}:{e}", f"poll error: {e}")
+                key = f"poll:{type(e).__name__}:{e}"
+                if _time.monotonic() - self._poll_error_at.get(key, -1e9) > 300:   # repeat every 5 min
+                    self._warned.discard(key)
+                self._poll_error_at[key] = _time.monotonic() if key not in self._warned else self._poll_error_at.get(key, 0)
+                self._warn_once(key, f"poll error: {e}")
             _time.sleep(self.POLL_INTERVAL)
 
     # A save is not atomic for many tools (truncate, then write): reading in
@@ -1228,24 +1252,35 @@ class OverleafSync:
         sentinel = self.output_dir / self.WIPE_SENTINEL
         wipes = [d for d, old, new in changes if self._is_wipe(old, new)]
         if wipes and not self.allow_wipe and sentinel.exists():
-            self._wipe_ok.update(wipes)          # the user confirmed what is held right now
+            # Only a confirmation made after the warning counts (a stray or old
+            # sentinel must not approve a wipe nobody has seen yet).
             try:
-                sentinel.unlink()
+                made = sentinel.stat().st_mtime
             except OSError:
-                pass
+                made = None
+            ok = [d for d in wipes if made is not None and d in self._wipe_warned_at
+                  and made >= self._wipe_warned_at[d] - 1.0]
+            if ok:
+                self._wipe_ok.update(ok)
+                try:
+                    sentinel.unlink()
+                except OSError:
+                    pass
         for doc_id, old, new in changes:
             current.add(doc_id)
             if self._is_wipe(old, new) and not self.allow_wipe and doc_id not in self._wipe_ok:
                 path = self._docs[doc_id]["path"]
+                self._wipe_warned_at.setdefault(doc_id, _time.time())
                 self._warn_once(
                     f"wipe:{doc_id}",
                     f"{path} was emptied locally; NOT sending it ({len(old)} chars would be deleted "
                     f"in Overleaf). Restore the file to cancel, or confirm with: "
-                    f"touch {sentinel}")
+                    f"touch {shlex.quote(str(sentinel))}")
                 continue
             if not self._is_wipe(old, new):
                 self._wipe_ok.discard(doc_id)
                 self._warned.discard(f"wipe:{doc_id}")
+                self._wipe_warned_at.pop(doc_id, None)
             seen = self._candidates.get(doc_id)       # (content, stable since, dirty since)
             if seen is None:
                 self._candidates[doc_id] = (new, now, now)
@@ -1268,6 +1303,9 @@ class OverleafSync:
             if doc_id not in current:
                 del self._candidates[doc_id]
         self._wipe_ok &= current
+        for gone in [d for d in self._wipe_warned_at if d not in current]:
+            del self._wipe_warned_at[gone]
+            self._warned.discard(f"wipe:{gone}")
         return ready
 
     # The last version both sides agreed on, kept on disk per doc, so edits made
@@ -1293,11 +1331,20 @@ class OverleafSync:
         try:
             d = self.output_dir / self.BASE_DIR
             d.mkdir(exist_ok=True)
-            (d / ".project").write_text(self.project_id)
+            if not self._base_project_written:
+                (d / ".project").write_text(self.project_id)
+                self._base_project_written = True
             atomic_write(self._base_path(doc_id), content)
             self._base_saved[doc_id] = content
         except OSError as e:
-            self._warn_once("base-write", f"could not save the merge base: {e}")
+            # A base that is older than what both sides now agree on would make the
+            # next start re-apply old edits; better none (server wins, local backed up).
+            self._base_saved.pop(doc_id, None)
+            try:
+                self._base_path(doc_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._warn_once("base-write", f"could not save the merge base ({e}); edits made while the sync is stopped will be backed up, not merged")
 
     @staticmethod
     def _is_wipe(old: str, new: str) -> bool:
@@ -1343,6 +1390,7 @@ class OverleafSync:
         keeps matching Overleaf.
         """
         changed: list[tuple[str, str, str]] = []
+        to_save: list[tuple[str, str]] = []
         with self._lock:
             for doc_id, state in list(self._docs.items()):
                 if state.get("inflight"):
@@ -1356,7 +1404,9 @@ class OverleafSync:
                     self._warn_once(f"unsafe:{state['path']}", f"not syncing {state['path']}: {e}")
                     continue
                 if fc == state["content"]:
-                    self._save_base(doc_id, fc)
+                    to_save.append((doc_id, fc))
+                    self._warned.discard(f"wipe:{doc_id}")      # restored: a later wipe warns again
+                    self._wipe_warned_at.pop(doc_id, None)
                     continue
                 if fc == self._rejected_content.get(doc_id):
                     self._warn_once(
@@ -1386,6 +1436,8 @@ class OverleafSync:
                     fc = sanitized
                 if fc != state["content"]:
                     changed.append((doc_id, state["content"], fc))
+        for doc_id, content in to_save:        # disk I/O outside the lock the socket handler needs
+            self._save_base(doc_id, content)
         return changed
 
     def _push_change(self, doc_id: str, old_content: str, new_content: str) -> bool:
@@ -1396,11 +1448,25 @@ class OverleafSync:
         cp_ops = compute_ot_ops(old_content, new_content)
         if not cp_ops:
             return True
-        # A deletion is only sent once its text is safely on disk (see
-        # _snapshot_before_delete); with a full disk it waits, additions still go.
-        doc = self._docs.get(doc_id)
-        if doc and not self._snapshot_before_delete(doc["path"], old_content, cp_ops):
-            return False
+        with self._lock:                        # cheap pre-check: do not record a push that will bail
+            doc = self._docs.get(doc_id)
+            if doc is None or doc["content"] != old_content or doc.get("inflight"):
+                return False
+            ws0 = self._ws
+            if not self._ws_ready.is_set() or ws0 is None or not ws0.is_connected():
+                self._ws_ready.clear()
+                return False
+            path0 = doc["path"]
+        # A change that deletes text is only sent once that text is safely on
+        # disk (see _snapshot_before_delete); with a full disk it waits as a
+        # whole.  Retries of the same change are recorded once.
+        key = (doc_id, hash(old_content), hash(new_content))
+        if key not in self._recorded:
+            if not self._snapshot_before_delete(path0, old_content, cp_ops):
+                return False
+            if len(self._recorded) > 500:
+                self._recorded.clear()
+            self._recorded.add(key)
         done = threading.Event()
         err: list = [None]
         with self._lock:
@@ -1647,7 +1713,7 @@ class OverleafSync:
                     os.replace(old_file, out_path)
                     print(f"  {_ts()} [sync] {old_path} was renamed in Overleaf → {pathname}", flush=True)
 
-            if out_path.exists() and old_content is not None:
+            if out_path.exists() and (not initial or old_content is not None):
                 branch: list[str] = []
 
                 def reconcile(local_content: str) -> str:
@@ -1756,8 +1822,11 @@ class OverleafSync:
                             auth_failures = 0
                         # Back off: hammering a rate-limiting server (HTTP 429)
                         # or a down one only makes the outage longer.
-                        print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in {retry:.0f}s", flush=True)
-                        _time.sleep(max(retry, getattr(e, "retry_after", None) or 0))
+                        wait = max(retry, getattr(e, "retry_after", None) or 0)
+                        print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in {wait:.0f}s", flush=True)
+                        end = _time.monotonic() + wait
+                        while self._running and _time.monotonic() < end:
+                            _time.sleep(min(1.0, max(0.0, end - _time.monotonic())))
                         retry = min(retry * 2, 30.0)
         except KeyboardInterrupt:
             print("\nStopping...")
