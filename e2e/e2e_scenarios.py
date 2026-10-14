@@ -46,9 +46,12 @@ B=f"http://127.0.0.1:18080/project/{PID}"
 PODMAN="podman --root /var/mnt/data/overleaf-ce-test/storage --runroot /run/user/1000/ol-ce-runroot"
 def ssh(cmd): return subprocess.run(["ssh","desktop",cmd],capture_output=True,text=True,timeout=120)
 s2=requests.Session(); s2.cookies.set("overleaf.sid",COOKIE,domain="127.0.0.1")
+_csrf=[None]
 def H():
-    t=s2.get(f"http://127.0.0.1:18080/project/{PID}").text
-    return {"X-Csrf-Token":html.unescape(re.search(r'name="ol-csrfToken"[^>]*content="([^"]*)"',t).group(1))}
+    if not _csrf[0]:
+        t=s2.get(f"http://127.0.0.1:18080/project/{PID}").text
+        _csrf[0]=html.unescape(re.search(r'name="ol-csrfToken"[^>]*content="([^"]*)"',t).group(1))
+    return {"X-Csrf-Token":_csrf[0]}
 
 def fresh():
     global p,R,M
@@ -148,7 +151,7 @@ def sc_symlink():
 
 def sc_big():
     """D: large document."""
-    cur=M.read_text(); big=cur+"".join(f"%% filler line {i} "+"x"*60+"\n" for i in range(30000))
+    cur=M.read_text(); big=cur+"".join(f"%% filler line {i} "+"x"*60+"\n" for i in range(18000))
     t0=time.time(); M.write_text(big)
     okp=wait(lambda:R.content("main.tex")[0]==big,90)
     check("D 2MB doc: pushed", okp, f"{len(big)} chars, {time.time()-t0:.1f}s")
@@ -156,6 +159,19 @@ def sc_big():
     check("D 2MB doc: remote edit arrives", wait(lambda:M.read_text()=="%% remote line\n"+big,60), f"{time.time()-t0:.1f}s")
     # shrink back
     M.write_text(cur); time.sleep(9); wait(lambda:R.content("main.tex")[0]==cur,60)
+
+def sc_toobig():
+    """J: a push over Overleaf's 2MB doc limit: server must stay intact, tool must not loop or corrupt."""
+    cur=M.read_text(); srv0=R.content("main.tex")[0]
+    big=cur+"".join(f"%% filler line {i} "+"x"*60+"\n" for i in range(40000))
+    M.write_text(big); time.sleep(40)
+    try: R.close()
+    except Exception: pass
+    globals()["R"]=Remote(); srv=R.content("main.tex")[0]
+    check("J over-limit: server doc not corrupted/truncated", len(srv)<=2*1024*1024 and srv.startswith(srv0[:200]), f"server={len(srv)} chars")
+    print("   server len",len(srv),"local len",len(M.read_text()), "| log tail:", logtxt()[-500:].replace("\n"," | "))
+    check("J over-limit: process still alive", p.poll() is None)
+    check("J over-limit: local file kept", len(M.read_text())==len(big))
 
 def sc_pause():
     """E: server paused / restarted with local edits pending."""
@@ -185,27 +201,26 @@ def sc_restart():
     check("F restart: local==server", converged())
 
 def sc_structure():
-    """H: folders, move, rename with a pending local edit (items 29-31)."""
-    r=s2.post(B+"/doc",json={"name":"mv.tex","parent_folder_id":R.root_id},headers=H()); did=r.json()["_id"]
-    wait(lambda:(OUT/"mv.tex").exists(),30); time.sleep(4)
-    (OUT/"mv.tex").write_text("hello from local\n"); wait(lambda:R.by.get("mv.tex") or True,1)
-    time.sleep(1)
-    R2=Remote(); check("H new doc content pushed", wait(lambda:R2.content("mv.tex")[0]=="hello from local\n",20)); R2.close()
-    r=s2.post(B+"/folder",json={"name":"sub","parent_folder_id":R.root_id},headers=H()); fid=r.json()["_id"]; time.sleep(4)
-    r=s2.post(B+f"/Doc/{did}/move",json={"folder_id":fid},headers=H()); print("move",r.status_code)
-    check("H move: appears under sub/", wait(lambda:(OUT/"sub/mv.tex").exists(),40), logtxt()[-200:])
-    # pending local edit while renamed remotely
-    (OUT/"sub/mv.tex").write_text("hello from local\nPENDING LOCAL EDIT\n")
-    r=s2.post(B+f"/doc/{did}/rename",json={"name":"mv2.tex"},headers=H()); print("rename",r.status_code)
+    """H: folders, move, rename with a pending local edit, delete+recreate (items 29-31)."""
+    MV,MV2,SUB=f"mv{RUN}.tex",f"mv2{RUN}.tex",f"sub{RUN}"
+    r=s2.post(B+"/doc",json={"name":MV,"parent_folder_id":R.root_id},headers=H()); did=r.json()["_id"]
+    wait(lambda:(OUT/MV).exists(),30); time.sleep(4)
+    (OUT/MV).write_text("hello from local\n"); time.sleep(1)
+    R2=Remote(); check("H new doc content pushed", wait(lambda:R2.content(MV)[0]=="hello from local\n",20)); R2.close()
+    r=s2.post(B+"/folder",json={"name":SUB,"parent_folder_id":R.root_id},headers=H()); fid=r.json()["_id"]; time.sleep(4)
+    r=s2.post(B+f"/doc/{did}/move",json={"folder_id":fid},headers=H()); print("move",r.status_code)
+    check("H move: appears in new folder", wait(lambda:(OUT/SUB/MV).exists(),40), logtxt()[-200:])
+    (OUT/SUB/MV).write_text("hello from local\nPENDING LOCAL EDIT\n")
+    r=s2.post(B+f"/doc/{did}/rename",json={"name":MV2},headers=H()); print("rename",r.status_code)
     time.sleep(15)
-    R2=Remote(); srv=R2.content("sub/mv2.tex")[0] if "sub/mv2.tex" in R2.by else None; R2.close()
-    print("   after rename: server =",repr(srv)," local sub/mv.tex =",repr((OUT/'sub/mv.tex').read_text()) if (OUT/'sub/mv.tex').exists() else None, " sub/mv2.tex =", (OUT/'sub/mv2.tex').read_text() if (OUT/'sub/mv2.tex').exists() else None)
-    survived = (srv and "PENDING" in srv) or ((OUT/'sub/mv.tex').exists() and "PENDING" in (OUT/'sub/mv.tex').read_text()) or ((OUT/'sub/mv2.tex').exists() and "PENDING" in (OUT/'sub/mv2.tex').read_text()) or any("PENDING" in p_.read_text() for p_ in OUT.rglob("*") if p_.is_file() and ".overleaf-sync-backup" in str(p_))
-    check("H rename with pending edit: edit survives somewhere", survived)
-    # delete and recreate same name
+    texts=[p_.read_text() for p_ in OUT.rglob("*") if p_.is_file()]
+    R2=Remote(); srv=R2.content(f"{SUB}/{MV2}")[0] if f"{SUB}/{MV2}" in R2.by else None; R2.close()
+    print("   server:",repr(srv),"| local files with PENDING:",[str(p_.relative_to(OUT)) for p_ in OUT.rglob("*") if p_.is_file() and "PENDING" in p_.read_text()])
+    check("H rename with pending edit: edit reaches the server", srv is not None and "PENDING" in srv)
     s2.delete(B+f"/doc/{did}",headers=H()); time.sleep(5)
-    r=s2.post(B+"/doc",json={"name":"mv2.tex","parent_folder_id":fid},headers=H()); time.sleep(8)
-    check("H delete+recreate: still syncing main.tex", (lambda: (M.write_text(M.read_text()+"%% post\n"), wait(lambda:"%% post" in R.content("main.tex")[0],20))[1])())
+    s2.post(B+"/doc",json={"name":MV2,"parent_folder_id":fid},headers=H()); time.sleep(8)
+    M.write_text(M.read_text()+"%% post\n")
+    check("H delete+recreate: still syncing main.tex", wait(lambda:"%% post" in R.content("main.tex")[0],20))
 
 def sc_unsafe_name():
     """I: hostile doc names."""
@@ -214,7 +229,7 @@ def sc_unsafe_name():
     time.sleep(8)
     check("I nothing written outside out dir", not Path("/tmp/olt/evil.tex").exists() and not Path("/tmp/evil.tex").exists())
 
-SC={"A":sc_random,"B":sc_editors,"C":sc_delete_recreate,"G":sc_symlink,"D":sc_big,"H":sc_structure,"I":sc_unsafe_name,"E":sc_pause,"F":sc_restart}
+SC={"A":sc_random,"B":sc_editors,"C":sc_delete_recreate,"G":sc_symlink,"D":sc_big,"H":sc_structure,"I":sc_unsafe_name,"J":sc_toobig,"E":sc_pause,"F":sc_restart}
 for name in sys.argv[1:] or SC:
     print(f"=== {name}",flush=True)
     try:

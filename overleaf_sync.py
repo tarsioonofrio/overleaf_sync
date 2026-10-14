@@ -566,6 +566,7 @@ def transform_x(left: list[dict], right: list[dict]) -> tuple[list[dict], list[d
 
 
 MIN_EVIDENCE_CHARS = 8
+MAX_DOC_LENGTH = 2 * 1024 * 1024    # Overleaf's per-document limit (UTF-16 units)
 
 
 def inflight_already_applied(inflight: dict, server_content: str, server_version: int) -> bool:
@@ -1006,6 +1007,10 @@ class OverleafSync:
         self._fatal: str | None = None
         # doc_id → (file content, first time seen with it); see _settled.
         self._candidates: dict[str, tuple[str, float]] = {}
+        # doc_id → pre-op doc, for docs whose last update the server rejected
+        self._pending_rejection: dict[str, str] = {}
+        # doc_id → content the server refused; not pushed again unchanged
+        self._rejected_content: dict[str, str] = {}
         self._started = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # -- incoming from Overleaf -----------------------------------------------
@@ -1043,6 +1048,9 @@ class OverleafSync:
                 inflight = state.get("inflight")
                 if inflight and (v is None or v >= state["version"]):
                     del state["inflight"]
+                    # A rejected op is announced by this same {v, doc} shape and
+                    # only then by otUpdateError, so remember the pre-op doc.
+                    state["pushed_from"] = inflight["base"]
                     inflight["done"].set()
                 if v is not None and v + 1 > state["version"]:
                     state["version"] = v + 1
@@ -1084,6 +1092,34 @@ class OverleafSync:
             label = (state["path"], state["version"], _ops_summary(ops) + note)
 
         print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
+
+    def _on_ot_error(self, args: list):
+        """
+        The server rejected an update (e.g. "Update takes doc over max doc
+        size").  It sends the same {v, doc} message as for an accepted op
+        first, so by now we may have counted the op as applied.  Our idea of
+        the server doc is wrong: keep the local file (backup + merge from the
+        pre-op doc on reconnect), never push that content again as is, and
+        reconnect to resync.
+        """
+        message = args[0] if args else "unknown error"
+        info = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
+        doc_id = info.get("doc_id")
+        print(f"  {_ts()} [sync] server rejected an update: {message}", flush=True)
+        with self._lock:
+            state = self._docs.get(doc_id)
+            if state is not None:
+                inflight = state.get("inflight")
+                self._pending_rejection[doc_id] = inflight["base"] if inflight else state.get("pushed_from", state["content"])
+                self._rejected_content[doc_id] = state["content"]
+                try:
+                    local = safe_join(self.output_dir, state["path"]).read_text(encoding="utf-8")
+                    self._backup_local(state["path"], local)
+                except (OSError, ValueError, UnicodeDecodeError):
+                    pass
+        ws = self._ws
+        if ws is not None:
+            self._force_reconnect(ws)
 
     # -- outgoing to Overleaf -------------------------------------------------
 
@@ -1236,6 +1272,18 @@ class OverleafSync:
                     continue
                 if fc == state["content"]:
                     continue
+                if fc == self._rejected_content.get(doc_id):
+                    self._warn_once(
+                        f"rejected:{doc_id}:{hash(fc)}",
+                        f"{state['path']}: Overleaf rejected this content; not sending it again "
+                        f"(change the file to retry). Your file is untouched.")
+                    continue
+                if len(fc.encode("utf-16-le", "surrogatepass")) // 2 > MAX_DOC_LENGTH:
+                    self._warn_once(
+                        f"toolong:{doc_id}:{hash(fc)}",
+                        f"{state['path']} is longer than Overleaf's {MAX_DOC_LENGTH}-character "
+                        f"document limit; not sending it. Your file is untouched.")
+                    continue
                 sanitized = sanitize_non_bmp(fc)
                 if sanitized != fc:
                     atomic_write(out_path, sanitized)
@@ -1358,6 +1406,7 @@ class OverleafSync:
 
         ws = TrackingSocketIOClient(session, self.project_id)
         ws.on("otUpdateApplied", self._on_ot_update)
+        ws.on("otUpdateError", self._on_ot_error)
         ws.on_handler_error = lambda name, exc: self._force_reconnect(ws)
 
         def on_tree_change(args, _name=None):
@@ -1428,6 +1477,10 @@ class OverleafSync:
                 # An unacked op may not have reached the server: merge from
                 # before it so it is re-pushed rather than silently dropped.
                 inflight = old_state.get("inflight")
+                if doc_id in self._pending_rejection:
+                    # The server refused our last update: merge from the doc as
+                    # it was before it, and never treat the local file as stale.
+                    inflight = {"base": self._pending_rejection.pop(doc_id), "ops": []}
                 merge_base = inflight["base"] if inflight else old_content
                 if inflight and inflight_already_applied(inflight, server_content, version):
                     merge_base = old_content    # the server already has our op
@@ -1437,6 +1490,20 @@ class OverleafSync:
                     "version": version,
                     "path": pathname,
                 }
+            old_path = old_state.get("path")
+            if not initial and old_path and old_path != pathname:
+                # Renamed / moved in Overleaf: carry the local file (and any
+                # edits pending in it) along, so they merge into the new doc
+                # instead of being stranded at a path that is no longer synced.
+                try:
+                    old_file = safe_join(self.output_dir, old_path)
+                except ValueError:
+                    old_file = None
+                if old_file is not None and old_file.is_file() and not out_path.exists():
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(old_file, out_path)
+                    print(f"  {_ts()} [sync] {old_path} was renamed in Overleaf → {pathname}", flush=True)
+
             if not initial and out_path.exists():
                 branch: list[str] = []
 
