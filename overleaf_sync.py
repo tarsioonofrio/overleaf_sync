@@ -26,6 +26,7 @@ import argparse
 import configparser
 import datetime
 import difflib
+import json
 import os
 import re
 import shutil
@@ -968,7 +969,7 @@ class OverleafSync:
         # Set by the watch thread on an unrecoverable condition; run() exits 1.
         self._fatal: str | None = None
         # doc_id → (file content, first time seen with it); see _settled.
-        self._candidates: dict[str, tuple[str, float]] = {}
+        self._candidates: dict[str, tuple[str, float, float]] = {}
         # doc_id → pre-op doc, for docs whose last update the server rejected
         self._pending_rejection: dict[str, str] = {}
         # doc_id → content the server refused; not pushed again unchanged
@@ -1147,6 +1148,7 @@ class OverleafSync:
     # file has had the same content on two consecutive polls, and a change that
     # wipes out most of the document must hold for BIG_DELETE_SECS.
     BIG_DELETE_SECS = 5.0
+    MAX_DEFER_SECS = 3.0
     BIG_DELETE_MIN_CHARS = 200
 
     @classmethod
@@ -1159,18 +1161,31 @@ class OverleafSync:
         return len(old) >= cls.BIG_DELETE_MIN_CHARS and kept < 0.5
 
     def _settled(self, changes: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
-        """Keep only the changes whose file content has been stable long enough."""
+        """
+        Keep only the changes whose file content is stable enough to push:
+        unchanged since the previous poll (so a half-written save is skipped),
+        held BIG_DELETE_SECS for a large deletion, but never deferred more
+        than MAX_DEFER_SECS while a writer keeps changing the file.
+        """
         now = _time.monotonic()
         ready = []
         current = set()
         for doc_id, old, new in changes:
             current.add(doc_id)
-            prev = self._candidates.get(doc_id)
-            if prev is None or prev[0] != new:
-                self._candidates[doc_id] = (new, now)
+            seen = self._candidates.get(doc_id)       # (content, stable since, dirty since)
+            if seen is None:
+                self._candidates[doc_id] = (new, now, now)
                 continue
-            if self._is_big_delete(old, new):
-                if now - prev[1] < self.BIG_DELETE_SECS:
+            content, stable_since, dirty_since = seen
+            big = self._is_big_delete(old, new)
+            if content != new:
+                self._candidates[doc_id] = (new, now, dirty_since)
+                if big or now - dirty_since < self.MAX_DEFER_SECS:
+                    continue
+                ready.append((doc_id, old, new))      # still changing, but waited long enough
+                continue
+            if big:
+                if now - stable_since < self.BIG_DELETE_SECS:
                     continue
                 print(f"  {_ts()} [sync] large deletion in {self._docs[doc_id]['path']} "
                       f"held {self.BIG_DELETE_SECS:.0f}s, pushing", flush=True)
@@ -1284,6 +1299,7 @@ class OverleafSync:
             state["content"] = new_content
 
         ops = ops_to_wire(old_content, cp_ops)
+        self._snapshot_before_delete(pathname, old_content, cp_ops)
         print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
 
         def on_ack(data):
@@ -1322,6 +1338,46 @@ class OverleafSync:
             ws.disconnect()
         except Exception:
             pass
+
+    BIG_SNAPSHOT_CHARS = 2000      # a push deleting this much also keeps a full copy
+    SNAPSHOT_MAX_FILES = 20
+
+    def _snapshot_before_delete(self, pathname: str, old_content: str, cp_ops: list[dict]) -> None:
+        """
+        Whatever goes wrong with a deletion (a stale save that overwrote a
+        coauthor's text, a tool bug, a mistake), the text must stay
+        recoverable.  Every deleted string is appended to deleted.jsonl with its
+        position; a push that deletes a lot also keeps the whole document as
+        Overleaf has it.  (Overleaf's own History has it too.)
+        """
+        deleted = [(o["p"], o["d"]) for o in cp_ops if "d" in o]
+        if not deleted:
+            return
+        try:
+            folder = self.output_dir / ".overleaf-sync-backup" / self._started
+            folder.mkdir(parents=True, exist_ok=True)
+            now = datetime.datetime.now().isoformat(timespec="milliseconds")
+            with open(folder / "deleted.jsonl", "a", encoding="utf-8") as log:
+                for p, text in deleted:
+                    # The diff deletes only the characters that differ, so the
+                    # record also keeps the whole line(s) they were part of.
+                    start = old_content.rfind("\n", 0, p) + 1
+                    if text.endswith("\n"):
+                        end = p + len(text)
+                    else:
+                        end = old_content.find("\n", p + len(text))
+                        end = len(old_content) if end < 0 else end + 1
+                    log.write(json.dumps({"time": now, "path": pathname, "pos": p, "deleted": text,
+                                          "lines": old_content[start:end]}, ensure_ascii=False) + "\n")
+            if sum(len(t) for _, t in deleted) >= self.BIG_SNAPSHOT_CHARS:
+                dest = folder / f"{pathname}.{datetime.datetime.now().strftime('%H%M%S.%f')}.before-push"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(old_content, encoding="utf-8")
+                snaps = sorted(folder.rglob("*.before-push"), key=lambda p: p.stat().st_mtime)
+                for stale in snaps[: max(0, len(snaps) - self.SNAPSHOT_MAX_FILES)]:
+                    stale.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"  {_ts()} [sync] could not write the deletion record: {e}", flush=True)
 
     def _resync_doc(self, doc_id: str, ws) -> None:
         """Re-join doc_id and merge the local file onto the server content."""
@@ -1527,7 +1583,7 @@ class OverleafSync:
             print(f"Error: initial sync failed: {e}")
             sys.exit(1)
 
-        print(f"\nBidirectional sync active... (Ctrl-C to stop)\n")
+        print(f"\nBidirectional sync active... (Ctrl-C to stop)\n", flush=True)
         self._watch_thread = threading.Thread(target=self._watch_files, daemon=True)
         self._watch_thread.start()
 

@@ -58,6 +58,19 @@ While a coauthor types, their ops are merged into the local file, never written 
 - 🧬 Concurrent edits: changes are diffed per hunk (patience diff) so a coauthor's text between two of your edits keeps its place; local files are swapped in with `renameat2(RENAME_EXCHANGE)` and the merge is redone if an editor saved meanwhile.
 - Overleaf itself rejects a delete whose text does not match the document, and keeps full history (restore from Overleaf's History if needed).
 
+## Known limit: whole-file saves that race a merge
+
+If a tool reads the *whole* file, edits it and writes it back (many editors, some agent "write file" tools) and that write lands in the few milliseconds after the sync merged a coauthor's text into the same file, the write was made from a copy that predates the merge. The coauthor's text disappears from the file and the next push deletes it on Overleaf. A file watcher cannot tell this from a deliberate deletion (several time-based repair heuristics were tried and rejected: they duplicated text and broke the concurrent-edit tests).
+
+Measured against a real Overleaf with a real browser typing (`e2e/browser_e2e.py`, BR9/BR10): with a coauthor typing continuously and the local tool saving 5–10 times per second, roughly 1 run in 6 overwrites 1–2 edits at 5–10 saves/s, and 10–20% under a deliberately adversarial writer that waits 40 ms between read and write. At human or agent pace (a save every few seconds) the window is a fraction of a millisecond per save.
+
+It is never silent and never unrecoverable:
+- every deleted string, with its whole line and position, is appended to `.overleaf-sync-backup/<start time>/deleted.jsonl` *before* the push;
+- a push that deletes 2000+ characters also keeps a full copy of the document as Overleaf had it (`*.before-push`, last 20);
+- Overleaf's History has the previous text as well.
+
+Tools that re-read the file at the moment of writing (e.g. targeted `Edit`/`str_replace` operations) shrink the window to microseconds. Editors that warn "file changed on disk" avoid it entirely.
+
 ## Reconnect invariants (data-loss prevention)
 
 These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
