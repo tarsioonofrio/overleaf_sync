@@ -1263,14 +1263,18 @@ class OverleafSync:
                 _time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
                 self._disconnect_ws()
+                retry = 2.0
                 while self._running:
                     try:
                         self._connect_and_sync_state(initial=False)
                         print(f"  {_ts()} [sync] reconnected", flush=True)
                         break
                     except Exception as e:
-                        print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in 2s", flush=True)
-                        _time.sleep(2)
+                        # Back off: hammering a rate-limiting server (HTTP 429)
+                        # or a down one only makes the outage longer.
+                        print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in {retry:.0f}s", flush=True)
+                        _time.sleep(retry)
+                        retry = min(retry * 2, 30.0)
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:

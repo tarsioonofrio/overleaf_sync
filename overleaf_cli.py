@@ -33,6 +33,7 @@ import json
 import re
 import sys
 import time
+import os
 import threading
 import urllib.parse
 from typing import Optional
@@ -40,7 +41,13 @@ from typing import Optional
 import requests
 import websocket  # pip install websocket-client
 
-BASE_URL = "https://www.overleaf.com"
+# Point OVERLEAF_URL at a self-hosted instance (e.g. http://localhost:8080) to
+# test against it; OVERLEAF_COOKIE_NAME is the session cookie there (CE uses
+# "overleaf.sid").
+BASE_URL = os.environ.get("OVERLEAF_URL", "https://www.overleaf.com").rstrip("/")
+COOKIE_NAME = os.environ.get("OVERLEAF_COOKIE_NAME", "overleaf_session2")
+_HOST = urllib.parse.urlparse(BASE_URL).hostname or "www.overleaf.com"
+WS_BASE = ("wss" if BASE_URL.startswith("https") else "ws") + "://" + BASE_URL.split("://", 1)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +60,7 @@ class OverleafSession:
     def __init__(self, session_cookie: str):
         self.session = requests.Session()
         # The only required cookie for auth is overleaf_session2
-        self.session.cookies.set("overleaf_session2", session_cookie, domain="www.overleaf.com")
+        self.session.cookies.set(COOKIE_NAME, session_cookie, domain=_HOST)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; overleaf-cli/1.0)",
             "Origin": BASE_URL,
@@ -325,7 +332,7 @@ class SocketIOClient:
             for c in self.session.session.cookies
         )
         ws_url = (
-            f"wss://www.overleaf.com/socket.io/1/websocket/{self._session_id}"
+            f"{WS_BASE}/socket.io/1/websocket/{self._session_id}"
             f"?projectId={self.project_id}&esh=1&ssp=1"
         )
 
