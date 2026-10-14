@@ -772,6 +772,26 @@ def collect_docs_from_project(project_data: dict) -> dict[str, str]:
     return docs
 
 
+def collect_tree(project_data: dict) -> tuple[dict[str, str], set[str]]:
+    """({folder path: folder id} with "" for the root, every entity path: docs, files, folders)."""
+    folders: dict[str, str] = {}
+    paths: set[str] = set()
+
+    def _recurse(folder: dict, prefix: str) -> None:
+        for kind in ("docs", "fileRefs"):
+            for e in folder.get(kind, []):
+                paths.add(prefix + e["name"])
+        for sub in folder.get("folders", []):
+            folders[prefix + sub["name"]] = sub["_id"]
+            paths.add(prefix + sub["name"])
+            _recurse(sub, prefix + sub["name"] + "/")
+
+    for root in project_data.get("rootFolder", []):
+        folders[""] = root["_id"]
+        _recurse(root, "")
+    return folders, paths
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -993,7 +1013,7 @@ class OverleafSync:
     POLL_INTERVAL = 0.5  # seconds between local file checks
 
     def __init__(self, project_id: str, session_cookie: str, output_dir: str,
-                 dry_run: bool = False, allow_wipe: bool = False):
+                 dry_run: bool = False, allow_wipe: bool = False, propagate_tree: bool = True):
         self.project_id = project_id
         self.session_cookie = session_cookie
         self.output_dir = Path(output_dir)
@@ -1009,6 +1029,16 @@ class OverleafSync:
         self._base_saved: dict[str, str] = {}    # doc_id → last base written to disk
         self._warned: set[str] = set()
         self._last_untracked_scan = 0.0
+        # propagate_tree: create / rename / delete docs in Overleaf when the local files are
+        # created / renamed / deleted (see _tree_scan).  Off → only text edits are synced.
+        self.propagate_tree = propagate_tree
+        self._http = None                         # OverleafSession of the current connection
+        self._folders: dict[str, str] = {}        # folder path ("" = root) → folder id
+        self._server_paths: set[str] = set()      # every entity path in the project (docs, files, folders)
+        self._last_tree_scan = 0.0
+        self._tree_seen: dict[tuple, float] = {}  # pending tree action → first time seen
+        self._tree_warned_at: dict[tuple, float] = {}
+        self._tree_retry_at: dict[tuple, float] = {}
 
         self._lock = threading.Lock()
         # doc_id → {content, version, path}
@@ -1204,6 +1234,8 @@ class OverleafSync:
                 continue
             try:
                 self._warn_untracked()
+                if self.propagate_tree:
+                    self._tree_scan(self._ws)
                 for doc_id, old, new in self._settled(self._collect_local_changes()):
                     if self.dry_run:
                         self._warn_once(
@@ -1355,26 +1387,241 @@ class OverleafSync:
             self._warned.add(key)
             print(f"  {_ts()} [sync] {msg}", flush=True)
 
+    # -- files created / renamed / deleted on disk -------------------------------------------------
+    #
+    # Creating and renaming are reversible and add nothing a coauthor loses, so they go through after
+    # TREE_HOLD_SECS of being stable (an editor's save-by-delete-and-recreate must not look like a
+    # delete).  Deleting is not: it needs the same `touch` confirmation as an emptied file, the whole
+    # document is kept in the backup folder first, and Overleaf keeps a deleted doc's history too.
+    # A big batch (a `git checkout`, an unzip) also needs the confirmation.
+    TREE_HOLD_SECS = 3.0
+    TREE_BULK = 20
+    TREE_RETRY_SECS = 60.0
+    TEXT_EXTS = frozenset(
+        "tex latex ltx sty cls bst bib bibtex txt md rmd rnw rtex tikz mtx asy lbx bbx cbx dtx ins ist def clo "
+        "ldf lco cfg lua gv mf yml yaml lhs mk xmpdata inc m".split())
+
+    def _eligible_new_file(self, rel: str, p: Path) -> bool:
+        name = rel.rsplit("/", 1)[-1]
+        if "." not in name or name.rsplit(".", 1)[1].lower() not in self.TEXT_EXTS:
+            return False
+        if not is_safe_relpath(rel) or len(name) > 150 or any(len(part) > 150 for part in rel.split("/")):
+            return False
+        if any(c in rel for c in '\\\0*<>:"|?') or p.is_symlink():
+            return False
+        try:
+            return p.stat().st_size <= 2 * 1024 * 1024
+        except OSError:
+            return False
+
+    def _list_local_files(self) -> list[tuple[str, Path]]:
+        out = []
+        for root, dirs, files in os.walk(self.output_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                if f.startswith(".") or f.endswith(".sync-tmp"):
+                    continue
+                p = Path(root) / f
+                out.append((p.relative_to(self.output_dir).as_posix(), p))
+        return out
+
     def _warn_untracked(self) -> None:
-        """Local files that are not Overleaf docs are never uploaded; say so."""
+        """Local files that will never be uploaded as documents; say so."""
         now = _time.monotonic()
         if now - self._last_untracked_scan < 5.0:
             return
         self._last_untracked_scan = now
         with self._lock:
             tracked = {s["path"] for s in self._docs.values()}
-        for p in self.output_dir.rglob("*"):
-            if not p.is_file() or p.name.endswith(".sync-tmp"):
+            server = set(self._server_paths)
+        for rel, p in self._list_local_files():
+            if rel in tracked:
                 continue
-            rel = p.relative_to(self.output_dir)
-            if any(part.startswith(".") for part in rel.parts):
-                continue  # backups, .git, editor temp files
-            if rel.as_posix() not in tracked:
-                self._warn_once(
-                    f"untracked:{rel}",
-                    f"{rel} is not an Overleaf document and will NOT be uploaded "
-                    f"(create it in Overleaf, then restart or wait for the tree refresh)",
-                )
+            if self.propagate_tree and rel not in server and self._eligible_new_file(rel, p):
+                continue                      # _tree_scan creates it
+            if rel in server:
+                why = "is not a text document in Overleaf"
+            elif self.propagate_tree:
+                why = "is not a text file type Overleaf edits (or is too big / has an unsafe name)"
+            else:
+                why = "is not an Overleaf document (create it in Overleaf, or drop --no-tree-sync)"
+            self._warn_once(f"untracked:{rel}", f"{rel} {why}; it will NOT be uploaded")
+
+    def _tree_scan(self, ws) -> None:
+        """Turn created / renamed / deleted local files into the same change in Overleaf."""
+        now = _time.monotonic()
+        if now - self._last_tree_scan < 1.0 or self._http is None or not self._ws_ready.is_set():
+            return
+        self._last_tree_scan = now
+        with self._lock:
+            if any(s.get("inflight") for s in self._docs.values()):
+                return
+            docs = {d: (s["path"], s["content"]) for d, s in self._docs.items()}
+            server = set(self._server_paths)
+        tracked = {path: d for d, (path, _) in docs.items()}
+        local = dict(self._list_local_files())
+        missing = {d: path for path, d in tracked.items() if path not in local}
+        new = [rel for rel, p in local.items()
+               if rel not in tracked and rel not in server and self._eligible_new_file(rel, p)]
+
+        # A missing doc and a new file with the very same text are a rename / move.
+        renames: dict[str, str] = {}
+        if missing and new:
+            texts: dict[str, str | None] = {}
+            for rel in new:
+                try:
+                    texts[rel] = sanitize_non_bmp(local[rel].read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError):
+                    texts[rel] = None
+            for d, path in missing.items():
+                same = [r for r in new if texts[r] is not None and texts[r] == docs[d][1]]
+                rivals = [m for m in missing if docs[m][1] == docs[d][1]]
+                if len(same) == 1 and len(rivals) == 1:
+                    renames[d] = same[0]
+        renamed_to = set(renames.values())
+        actions = [("rename", d, r) for d, r in sorted(renames.items())]
+        actions += [("create", r) for r in sorted(new) if r not in renamed_to]
+        actions += [("delete", d) for d in sorted(missing) if d not in renames]
+
+        current = set(actions)
+        for key in list(self._tree_seen):
+            if key not in current:
+                del self._tree_seen[key]
+                self._tree_warned_at.pop(key, None)
+                self._warned.discard(("tree-warn", key))
+        for key in actions:
+            self._tree_seen.setdefault(key, now)
+        ready = [k for k in actions if now - self._tree_seen[k] >= self.TREE_HOLD_SECS
+                 and now >= self._tree_retry_at.get(k, 0.0)]
+        if not ready:
+            return
+
+        bulk = sum(k[0] != "delete" for k in ready) > self.TREE_BULK
+        needs = [k for k in ready if k[0] == "delete" or (bulk and k[0] != "delete")]
+        if needs and not self.allow_wipe:
+            sentinel = self.output_dir / self.WIPE_SENTINEL
+            for k in needs:
+                self._tree_warned_at.setdefault(k, _time.time())
+            fresh = [k for k in needs if ("tree-warn", k) not in self._warned]
+            if fresh:
+                self._warned.update(("tree-warn", k) for k in fresh)
+                names = ", ".join((docs[k[1]][0] if k[0] == "delete" else k[-1]) for k in fresh[:5])
+                more = f" and {len(fresh) - 5} more" if len(fresh) > 5 else ""
+                what = "deleted locally" if not bulk else "created or moved at once"
+                print(f"  {_ts()} [sync] {len(fresh)} file(s) {what}: {names}{more}. NOT changing them in "
+                      f"Overleaf. Restore the file (or restart the sync) to cancel, or confirm with: touch {shlex.quote(str(sentinel))}", flush=True)
+            try:
+                made = sentinel.stat().st_mtime
+            except OSError:
+                made = None
+            confirmed = {k for k in needs if made is not None and made >= self._tree_warned_at[k] - 1.0}
+            if confirmed:
+                try:
+                    sentinel.unlink()
+                except OSError:
+                    pass
+            ready = [k for k in ready if k not in needs or k in confirmed]
+        if not ready:
+            return
+
+        done = False
+        for key in ready:
+            if self.dry_run:
+                self._warn_once(f"dry-tree:{key}", f"[dry-run] would {key[0]} {key[-1] if key[0] != 'delete' else docs[key[1]][0]} in Overleaf; nothing sent")
+                continue
+            try:
+                self._apply_tree_action(key, docs, local)
+                done = True
+            except Exception as e:
+                if type(e).__name__ == "AuthError":
+                    raise
+                wait = max(self.TREE_RETRY_SECS, getattr(e, "retry_after", None) or 0)
+                self._tree_retry_at[key] = _time.monotonic() + wait
+                self._warn_once(f"tree-err:{key}:{e}", f"could not {key[0]} {key[-1] if key[0] != 'delete' else docs[key[1]][0]}: {e} "
+                                f"(trying again in {wait:.0f}s)")
+        if done:
+            self._tree_seen.clear()
+            self._force_reconnect(ws)          # re-join: the tree and the docs are rebuilt (and merged)
+
+    def _ensure_folder(self, folder: str) -> str:
+        """Folder id for a path, creating the missing parents."""
+        parts = folder.split("/") if folder else []
+        for i in range(len(parts) + 1):
+            sub = "/".join(parts[:i])
+            if sub in self._folders:
+                continue
+            parent = "/".join(parts[:i - 1])
+            made = self._http.create_folder(self.project_id, parts[i - 1], self._folders[parent])
+            self._folders[sub] = made["_id"]
+            self._server_paths.add(sub)
+            print(f"  {_ts()} [sync] created folder {sub}/ in Overleaf", flush=True)
+        return self._folders[folder]
+
+    def _apply_tree_action(self, key: tuple, docs: dict, local: dict) -> None:
+        kind = key[0]
+        if kind == "create":
+            rel = key[1]
+            if rel in self._server_paths:
+                return
+            try:
+                local[rel].read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                raise RuntimeError(f"not readable as UTF-8 text ({e})")
+            folder, _, name = rel.rpartition("/")
+            made = self._http.create_doc(self.project_id, name, self._ensure_folder(folder))
+            self._server_paths.add(rel)
+            print(f"  {_ts()} [sync] new local file {rel} → created in Overleaf"
+                  f"{'' if made.get('_id') else ' (no id returned)'}", flush=True)
+        elif kind == "rename":
+            _, doc_id, new_rel = key
+            old_rel = docs[doc_id][0]
+            old_folder, _, old_name = old_rel.rpartition("/")
+            new_folder, _, new_name = new_rel.rpartition("/")
+            if new_rel in self._server_paths:
+                raise RuntimeError(f"{new_rel} already exists in Overleaf")
+            if old_folder == new_folder:
+                self._http.rename_doc(self.project_id, doc_id, new_name)
+            else:
+                target = self._ensure_folder(new_folder)
+                if old_name == new_name:
+                    self._http.move_doc(self.project_id, doc_id, target)
+                elif (new_folder + "/" + old_name).lstrip("/") not in self._server_paths:
+                    self._http.move_doc(self.project_id, doc_id, target)       # move first, then rename
+                    self._http.rename_doc(self.project_id, doc_id, new_name)
+                elif (old_folder + "/" + new_name).lstrip("/") not in self._server_paths:
+                    self._http.rename_doc(self.project_id, doc_id, new_name)   # rename first, then move
+                    self._http.move_doc(self.project_id, doc_id, target)
+                else:
+                    raise RuntimeError("both intermediate names are taken in Overleaf")
+            print(f"  {_ts()} [sync] {old_rel} was renamed locally → {new_rel} in Overleaf", flush=True)
+        elif kind == "delete":
+            doc_id = key[1]
+            path, content = docs[doc_id]
+            if not self._record_doc_deletion(path, content):
+                raise RuntimeError("could not keep a copy of the document first")
+            self._http.delete_doc(self.project_id, doc_id)
+            self._base_saved.pop(doc_id, None)
+            try:
+                self._base_path(doc_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            print(f"  {_ts()} [sync] {path} deleted locally (confirmed) → deleted in Overleaf; "
+                  f"a copy is in {self.output_dir}/.overleaf-sync-backup/{self._started}/", flush=True)
+
+    def _record_doc_deletion(self, path: str, content: str) -> bool:
+        try:
+            folder = self.output_dir / ".overleaf-sync-backup" / self._started
+            dest = folder / "deleted-docs" / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+            with open(folder / "deleted.jsonl", "a", encoding="utf-8") as log:
+                log.write(json.dumps({"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                                      "path": path, "deleted_document": True, "chars": len(content)},
+                                     ensure_ascii=False) + "\n")
+            return True
+        except OSError as e:
+            self._warn_once(f"record-doc:{e.errno}", f"cannot keep a copy of {path} ({e}); not deleting it in Overleaf")
+            return False
 
     def _dir_inode(self) -> int | None:
         try:
@@ -1610,6 +1857,7 @@ class OverleafSync:
 
         session = OverleafSession(self.session_cookie)
         session.get_project_bootstrap(self.project_id)
+        self._http = session
 
         ws = TrackingSocketIOClient(session, self.project_id)
         ws.on("otUpdateApplied", self._on_ot_update)
@@ -1655,6 +1903,8 @@ class OverleafSync:
         docs = filter_safe_docs(collect_docs_from_project(project_data))
         if not docs:
             raise RuntimeError("no documents found in project")
+        with self._lock:
+            self._folders, self._server_paths = collect_tree(project_data)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1745,6 +1995,10 @@ class OverleafSync:
                     else:
                         print(f"  {_ts()} [sync] local edit pending on {pathname} — merged", flush=True)
                     continue
+            if not initial and self.propagate_tree and old_content is not None and not out_path.exists():
+                # Deleted or moved on disk: _tree_scan decides (rewriting it here would bring
+                # back the old name of a rename, and leave a duplicate doc behind).
+                continue
             if initial and out_path.exists():
                 try:
                     previous = out_path.read_text(encoding="utf-8")
@@ -1892,6 +2146,7 @@ def resolve_settings(args, cfg: dict) -> dict:
         "output_dir": str(Path(output_dir).expanduser()),
         "dry_run": args.dry_run or bool(pick("dry_run")),
         "allow_wipe": args.allow_wipe or bool(pick("allow_wipe")),
+        "tree_sync": not args.no_tree_sync and pick("tree_sync") is not False,
         "allow_unknown_protocol": args.allow_unknown_protocol or bool(pick("allow_unknown_protocol")),
     }
 
@@ -1995,6 +2250,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--listen", action="store_true", help="one-way mirror Overleaf → local")
     parser.add_argument("--allow-wipe", action="store_true",
                         help="push a file emptied locally without asking (default: hold it until confirmed)")
+    parser.add_argument("--no-tree-sync", action="store_true",
+                        help="do not create / rename / delete Overleaf documents when local files are created / renamed / deleted")
     parser.add_argument("--allow-unknown-protocol", action="store_true",
                         help="go on even if the server announces an OT protocol stage other than 0 (unsupported, may corrupt documents)")
     parser.add_argument("--dry-run", action="store_true",
@@ -2046,6 +2303,7 @@ def main(argv: list[str] | None = None):
             output_dir=settings["output_dir"],
             dry_run=settings["dry_run"],
             allow_wipe=settings["allow_wipe"],
+            propagate_tree=settings["tree_sync"],
         ).run()
 
 

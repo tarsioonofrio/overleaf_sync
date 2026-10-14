@@ -119,7 +119,8 @@ def test_atomic_write_replaces_without_leftovers(tmp_path):
 
 
 def test_untracked_local_file_is_warned_not_uploaded(tmp_path, capsys):
-    sync = _sync(tmp_path)
+    sync = OverleafSync("pid", "cookie", str(tmp_path), propagate_tree=False)
+    sync._docs["d1"] = {"content": "x" * 500, "version": 5, "path": "main.tex"}
     (tmp_path / "main.tex").write_text("x")
     (tmp_path / "new.tex").write_text("y")
     (tmp_path / ".git").mkdir()

@@ -217,6 +217,38 @@ class OverleafSession:
             h["X-Csrf-Token"] = self._csrf_token
         return h
 
+    # -- project tree (documents and folders) ---------------------------------
+
+    def _tree_request(self, method: str, project_id: str, path: str, payload: Optional[dict] = None) -> dict:
+        r = self.session.request(method, f"{BASE_URL}/project/{project_id}/{path}",
+                                 json=payload, headers=self._json_headers(), timeout=30)
+        if r.status_code == 429:
+            raise RateLimited(r.headers.get("Retry-After"))
+        if r.status_code in (401, 403):
+            raise AuthError(f"Overleaf refused {method} {path.split('/')[0]} (HTTP {r.status_code}): "
+                            f"expired session, or no edit access to this project")
+        if not r.ok:
+            raise RuntimeError(f"{method} {path} failed: HTTP {r.status_code} {r.text[:200].strip()}")
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+
+    def create_doc(self, project_id: str, name: str, parent_folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, "doc", {"name": name, "parent_folder_id": parent_folder_id})
+
+    def create_folder(self, project_id: str, name: str, parent_folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, "folder", {"name": name, "parent_folder_id": parent_folder_id})
+
+    def rename_doc(self, project_id: str, doc_id: str, name: str) -> dict:
+        return self._tree_request("POST", project_id, f"doc/{doc_id}/rename", {"name": name})
+
+    def move_doc(self, project_id: str, doc_id: str, folder_id: str) -> dict:
+        return self._tree_request("POST", project_id, f"doc/{doc_id}/move", {"folder_id": folder_id})
+
+    def delete_doc(self, project_id: str, doc_id: str) -> dict:
+        return self._tree_request("DELETE", project_id, f"doc/{doc_id}")
+
 
 # ---------------------------------------------------------------------------
 # STEP 3: File Blob API  (content-addressed, Git-style SHA hashes)

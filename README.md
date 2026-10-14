@@ -19,7 +19,7 @@ Early MVP. The core sync loop is fully working:
 - polls for remote changes and merges them locally
 - triggers LaTeX compile on demand
 
-Not yet covered: folder operations.
+Files created, renamed, moved or deleted on disk are mirrored in the project (see below); binary files (images, PDFs) are never uploaded.
 
 ## Usage
 
@@ -60,7 +60,8 @@ While a coauthor types, their ops are merged into the local file, never written 
 - 😀 Overleaf stores every character outside the BMP (emoji, some math symbols) as two U+FFFD, even when typed in the browser. The sync mirrors that in the local file (and says so), so `😀` becomes `��` on disk.
 - 📝 Local writes are atomic (temp file + rename) and the merge re-reads the file right before replacing it, so an editor save in between is not lost.
 - 🌲 When a doc is added, renamed, moved or removed in Overleaf, the sync reconnects to rebuild the doc tree; docs removed upstream stop syncing (local copy untouched). Events used: `reciveNewDoc`, `reciveEntityRename`, `reciveEntityMove`, `removeEntity` (names as in Overleaf's realtime server; not yet verified against a live project).
-- ⚠️ Local files that are not Overleaf docs are never uploaded; a warning is printed.
+- 📁 **Files on disk → project tree** (`--no-tree-sync` / `tree_sync = false` turns it off). A new text file (`.tex .bib .sty .cls .md …`) is created in Overleaf, with its folders, once it has been there for 3 s; a file renamed or moved with its text unchanged becomes a rename / move of the same doc (comments, history and the doc id are kept). Two docs with identical text are never guessed as a rename. **Deleting is never automatic**: the sync says so and waits for `touch <dir>/.overleaf-sync-confirm-wipe` (or `--allow-wipe`); before deleting it keeps the whole doc in `.overleaf-sync-backup/<timestamp>/deleted-docs/` and `deleted.jsonl`. Restoring the file, or restarting the sync, cancels a pending delete. A batch of more than 20 creates/moves at once (an unzip, a branch switch) needs the same confirmation. Folders are only created when needed, never deleted.
+- ⚠️ Other local files (images, PDFs, odd names) are never uploaded; a warning is printed.
 - 🧪 `--dry-run`: pulls from Overleaf but never sends; logs what would be pushed. Use it first on a real project.
 - 🚫 If the server rejects an update (`otUpdateError`, e.g. over the 2 MB doc limit) the local file is backed up and kept, merged from the pre-update doc on reconnect, and that content is not sent again unless the file changes. Content over 2 MiB is not sent at all.
 - 💽 Disk full / no permission: if an incoming update cannot be written, the in-memory state is rolled back and the sync reconnects, so the unwritten text is never mistaken for a local deletion. A change that deletes text is only sent after that text has been recorded in `.overleaf-sync-backup` (if that fails the whole change waits and a warning says why; pure additions still go). If a coauthor edits a doc while its emptied-file wipe is waiting for confirmation, the wipe is cancelled and the file gets the full text back.
