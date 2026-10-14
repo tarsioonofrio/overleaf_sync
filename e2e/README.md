@@ -15,3 +15,7 @@ doc, connection drop with edits on both sides).
    `e2e_tree_and_outage.py` (paths are `/tmp/olt` and `/tmp/olt/venv`).
 
 The sync reads `OVERLEAF_URL` and `OVERLEAF_COOKIE_NAME` (`overleaf.sid` on CE).
+
+## Real overleaf.com with a real Chrome
+
+`real_browser_ctl.py` is the local half of scenarios where a real Chrome edits the web editor (driven by Claude in Chrome, timed `view.dispatch` calls) while files change locally: typing, same-line edits, deletion, whole-file reformat, Unicode, second document, burst, undo, offline restart, full wipe, over-2-MiB file. It verifies browser == server == local and that nothing was lost or duplicated. Use a throw-away project only; `restore` rewrites it.
