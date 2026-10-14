@@ -187,6 +187,18 @@ def _default_firefox_profile_dir() -> Path | None:
     return dbs[0].parent if dbs else None
 
 
+def read_cookie_file(path: str) -> str:
+    """Read the cookie from a file (keeps it out of `ps` and shell history)."""
+    p = Path(path).expanduser()
+    if p.stat().st_mode & 0o077:
+        print(f"Warning: {p} is readable by other users; run chmod 600 {p}", file=sys.stderr)
+    value = p.read_text(encoding="utf-8").strip()
+    if not value:
+        print(f"Error: {p} is empty", file=sys.stderr)
+        sys.exit(1)
+    return value
+
+
 def load_overleaf_cookie(
     explicit_cookie: str | None = None,
     firefox_profile: str | None = None,
@@ -1545,7 +1557,19 @@ class OverleafSync:
 
     # -- startup --------------------------------------------------------------
 
+    def _acquire_dir_lock(self) -> None:
+        """Two syncs on one directory would fight over the files; refuse the second."""
+        import fcntl
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(self.output_dir / ".overleaf-sync.lock", "w")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(f"Error: another overleaf-sync is already syncing {self.output_dir}", file=sys.stderr)
+            sys.exit(1)
+
     def run(self):
+        self._acquire_dir_lock()
         self._running = True
         try:
             self._connect_and_sync_state(initial=True)
@@ -1570,12 +1594,22 @@ class OverleafSync:
                 backoff = min(backoff * 2, 30.0)
                 self._disconnect_ws()
                 retry = 2.0
+                auth_failures = 0
                 while self._running:
                     try:
                         self._connect_and_sync_state(initial=False)
                         print(f"  {_ts()} [sync] reconnected", flush=True)
                         break
                     except Exception as e:
+                        if type(e).__name__ == "AuthError":
+                            auth_failures += 1
+                            if auth_failures >= 3:
+                                self._fatal = (f"{e}\nLocal files are untouched; nothing more "
+                                               f"will be sent to Overleaf.")
+                                self._running = False
+                                break
+                        else:
+                            auth_failures = 0
                         # Back off: hammering a rate-limiting server (HTTP 429)
                         # or a down one only makes the outage longer.
                         print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in {retry:.0f}s", flush=True)
@@ -1626,6 +1660,8 @@ def main():
                         help="Overleaf project ID (from the URL); auto-detected from git remote if omitted)")
     parser.add_argument("--cookie", default=None,
                         help="overleaf_session2 cookie value (overrides Firefox/default lookup)")
+    parser.add_argument("--cookie-file", default=None,
+                        help="File holding the cookie value (safer than --cookie: not visible in ps)")
     parser.add_argument("--firefox-profile", default=None,
                         help="Firefox profile directory to read cookies.sqlite from")
     parser.add_argument("--cookie-db", default=None,
@@ -1662,6 +1698,8 @@ def main():
     if args.output_dir is None:
         args.output_dir = os.path.join(os.getcwd(), args.project_id)
 
+    if args.cookie_file and not args.cookie:
+        args.cookie = read_cookie_file(args.cookie_file)
     session_cookie = load_overleaf_cookie(
         explicit_cookie=args.cookie,
         firefox_profile=args.firefox_profile,

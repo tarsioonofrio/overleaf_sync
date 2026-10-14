@@ -54,6 +54,10 @@ WS_BASE = ("wss" if BASE_URL.startswith("https") else "ws") + "://" + BASE_URL.s
 # STEP 1 & 2: Authentication + Project Bootstrap
 # ---------------------------------------------------------------------------
 
+class AuthError(RuntimeError):
+    """The session cookie was rejected (expired, logged out, or wrong)."""
+
+
 class OverleafSession:
     """Manages auth and extracts bootstrap data from Overleaf project page."""
 
@@ -82,6 +86,13 @@ class OverleafSession:
           - ol-otMigrationStage  → 0 = old OT protocol, 1+ = new history protocol
         """
         resp = self.session.get(f"{BASE_URL}/project/{project_id}")
+        if resp.status_code in (401, 403) or "/login" in resp.url:
+            raise AuthError(
+                "Overleaf rejected the session cookie (expired, logged out or wrong). "
+                "Log in again in the browser and pass a fresh cookie."
+            )
+        if resp.status_code == 404:
+            raise RuntimeError(f"project {project_id} not found (or no access)")
         resp.raise_for_status()
 
         bootstrap = {}

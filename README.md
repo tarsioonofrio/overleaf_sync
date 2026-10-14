@@ -51,6 +51,11 @@ While a coauthor types, their ops are merged into the local file, never written 
 - 🌲 When a doc is added, renamed, moved or removed in Overleaf, the sync reconnects to rebuild the doc tree; docs removed upstream stop syncing (local copy untouched). Events used: `reciveNewDoc`, `reciveEntityRename`, `reciveEntityMove`, `removeEntity` (names as in Overleaf's realtime server; not yet verified against a live project).
 - ⚠️ Local files that are not Overleaf docs are never uploaded; a warning is printed.
 - 🧪 `--dry-run`: pulls from Overleaf but never sends; logs what would be pushed. Use it first on a real project.
+- 🚫 If the server rejects an update (`otUpdateError`, e.g. over the 2 MB doc limit) the local file is backed up and kept, merged from the pre-update doc on reconnect, and that content is not sent again unless the file changes. Content over 2 MiB is not sent at all.
+- 🔒 One sync per directory (lock file); a second instance exits.
+- 🔑 `--cookie-file` keeps the cookie out of `ps`/history; an expired or revoked session stops the sync with a clear error after 3 attempts (files untouched).
+- 🪢 A doc renamed or moved in Overleaf takes its local file (and pending edits) along.
+- 🧬 Concurrent edits: changes are diffed per hunk (patience diff) so a coauthor's text between two of your edits keeps its place; local files are swapped in with `renameat2(RENAME_EXCHANGE)` and the merge is redone if an editor saved meanwhile.
 - Overleaf itself rejects a delete whose text does not match the document, and keeps full history (restore from Overleaf's History if needed).
 
 ## Reconnect invariants (data-loss prevention)

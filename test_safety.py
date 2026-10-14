@@ -234,3 +234,47 @@ def test_update_file_keeps_permissions(tmp_path):
     p = tmp_path / "a.tex"; p.write_text("x"); p.chmod(0o640)
     overleaf_sync.update_file(p, lambda t: t + "y")
     assert p.read_text() == "xy" and (p.stat().st_mode & 0o777) == 0o640
+
+
+# --- instance lock, cookie file, auth failures -------------------------------
+
+def test_second_instance_on_same_dir_is_refused(tmp_path):
+    first = OverleafSync("pid", "cookie", str(tmp_path))
+    first._acquire_dir_lock()
+    second = OverleafSync("pid", "cookie", str(tmp_path))
+    with pytest.raises(SystemExit) as e:
+        second._acquire_dir_lock()
+    assert e.value.code == 1
+
+
+def test_lock_is_released_when_first_instance_goes_away(tmp_path):
+    first = OverleafSync("pid", "cookie", str(tmp_path))
+    first._acquire_dir_lock()
+    first._lock_file.close()
+    OverleafSync("pid", "cookie", str(tmp_path))._acquire_dir_lock()
+
+
+def test_cookie_file_is_read_and_loose_permissions_warned(tmp_path, capsys):
+    f = tmp_path / "c.txt"; f.write_text("s:abc\n"); f.chmod(0o644)
+    assert overleaf_sync.read_cookie_file(str(f)) == "s:abc"
+    assert "readable by other users" in capsys.readouterr().err
+    f.chmod(0o600)
+    overleaf_sync.read_cookie_file(str(f))
+    assert capsys.readouterr().err == ""
+
+
+def test_empty_cookie_file_is_an_error(tmp_path):
+    f = tmp_path / "c.txt"; f.write_text("  \n"); f.chmod(0o600)
+    with pytest.raises(SystemExit):
+        overleaf_sync.read_cookie_file(str(f))
+
+
+def test_login_redirect_is_reported_as_auth_error(monkeypatch):
+    from overleaf_cli import AuthError, OverleafSession
+    class Resp:
+        status_code = 200; url = "http://x/login?redir=/project/1"; text = ""
+        def raise_for_status(self): pass
+    s = OverleafSession("bad")
+    monkeypatch.setattr(s.session, "get", lambda *a, **k: Resp())
+    with pytest.raises(AuthError):
+        s.get_project_bootstrap("1")
