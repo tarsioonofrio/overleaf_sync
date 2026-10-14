@@ -436,18 +436,24 @@ class SocketIOClient:
     def join_doc(self, doc_id: str) -> tuple[list[str], int]:
         """
         Send joinDoc and get document lines + version.
-        Returns (lines, version).
+        Returns (lines, version).  Raises RuntimeError on timeout or error
+        ack: an unanswered join must never look like an empty document.
         """
         lines = []
         version = 0
         done = threading.Event()
+        ok = [False]
+        err: list = [None]
 
         def on_ack(data):
             nonlocal version
             # data = [null, [lines...], version, ranges, ...]
-            if data and len(data) >= 3:
-                lines.extend(data[1] or [])
+            if data and data[0] is None and len(data) >= 3 and data[1] is not None:
+                lines.extend(data[1])
                 version = data[2] or 0
+                ok[0] = True
+            else:
+                err[0] = data[0] if data and data[0] is not None else data
             done.set()
 
         self.send_event(
@@ -455,7 +461,10 @@ class SocketIOClient:
             [doc_id, {"encodeRanges": True}],
             callback=on_ack
         )
-        done.wait(timeout=10)
+        if not done.wait(timeout=10):
+            raise RuntimeError(f"joinDoc {doc_id}: no answer from server")
+        if not ok[0]:
+            raise RuntimeError(f"joinDoc {doc_id} failed: {err[0]}")
         return lines, version
 
     def apply_insert(self, doc_id: str, position: int, text: str, version: int) -> bool:

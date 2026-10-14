@@ -514,6 +514,9 @@ class TrackingSocketIOClient:
         from overleaf_cli import SocketIOClient as _Base
         self._base = _Base(session, project_id)
         self._handlers: dict[str, callable] = {}
+        # Called when a handler raises: our in-memory state may now differ
+        # from the server's, so the owner must resync before pushing again.
+        self.on_handler_error: callable | None = None
         self._orig_on_close = self._base._on_close
         # Override the base _handle_event to route through our handlers
         self._base._handle_event = self._handle_event
@@ -528,6 +531,8 @@ class TrackingSocketIOClient:
                 self._handlers[name](args)
             except Exception as e:
                 print(f"  [ws] handler error for {name}: {e}")
+                if self.on_handler_error:
+                    self.on_handler_error(name, e)
 
     def _on_close(self, ws, code, msg):
         self._base._connected.clear()
@@ -751,6 +756,9 @@ class OverleafSync:
         self._public_id: str = ""
         # Set by the watch thread on an unrecoverable condition; run() exits 1.
         self._fatal: str | None = None
+        # doc_id → (file content, first time seen with it); see _settled.
+        self._candidates: dict[str, tuple[str, float]] = {}
+        self._started = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # -- incoming from Overleaf -----------------------------------------------
 
@@ -797,6 +805,12 @@ class OverleafSync:
             # user's not-yet-pushed edits.  Remote ops are relative to the
             # server doc, so transform them past both before applying, rather
             # than overwriting the file with the server content.
+            if v is not None and v > state["version"]:
+                # We missed updates: our copy no longer matches the server, so
+                # anything pushed from it could land at the wrong position.
+                raise RuntimeError(
+                    f"{state['path']}: update gap (got v{v}, expected v{state['version']})"
+                )
             inflight = state.get("inflight")
             base = inflight["base"] if inflight else state["content"]
             remote = wire_to_cp(base, ops)
@@ -869,11 +883,50 @@ class OverleafSync:
                 _time.sleep(SETTLE_SECS - age)
                 continue
             try:
-                for doc_id, old, new in self._collect_local_changes():
+                for doc_id, old, new in self._settled(self._collect_local_changes()):
                     self._push_change(doc_id, old, new)
             except Exception as e:
                 print(f"  {_ts()} [sync] poll error: {e}", flush=True)
             _time.sleep(self.POLL_INTERVAL)
+
+    # A save is not atomic for many tools (truncate, then write): reading in
+    # between yields a half-written or empty file, which would be pushed to
+    # Overleaf as "delete everything".  So a change is only pushed once the
+    # file has had the same content on two consecutive polls, and a change that
+    # wipes out most of the document must hold for BIG_DELETE_SECS.
+    BIG_DELETE_SECS = 5.0
+    BIG_DELETE_MIN_CHARS = 200
+
+    @classmethod
+    def _is_big_delete(cls, old: str, new: str) -> bool:
+        if not old.strip():
+            return False
+        if not new.strip():
+            return True
+        kept = len(new) / len(old)
+        return len(old) >= cls.BIG_DELETE_MIN_CHARS and kept < 0.5
+
+    def _settled(self, changes: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+        """Keep only the changes whose file content has been stable long enough."""
+        now = _time.monotonic()
+        ready = []
+        current = set()
+        for doc_id, old, new in changes:
+            current.add(doc_id)
+            prev = self._candidates.get(doc_id)
+            if prev is None or prev[0] != new:
+                self._candidates[doc_id] = (new, now)
+                continue
+            if self._is_big_delete(old, new):
+                if now - prev[1] < self.BIG_DELETE_SECS:
+                    continue
+                print(f"  {_ts()} [sync] large deletion in {self._docs[doc_id]['path']} "
+                      f"held {self.BIG_DELETE_SECS:.0f}s, pushing", flush=True)
+            ready.append((doc_id, old, new))
+        for doc_id in list(self._candidates):
+            if doc_id not in current:
+                del self._candidates[doc_id]
+        return ready
 
     def _dir_inode(self) -> int | None:
         try:
@@ -961,8 +1014,21 @@ class OverleafSync:
             self._ws_ready.clear()
             return False
         print(f"  [sync] push of {pathname} failed ({err[0] or 'no echo'}), re-syncing from Overleaf...", flush=True)
-        self._resync_doc(doc_id, ws)
+        try:
+            self._resync_doc(doc_id, ws)
+        except Exception as e:
+            # Can't trust our state: drop the socket so the reconnect path
+            # re-joins every doc and merges (it keeps the in-flight base).
+            print(f"  [sync] re-sync of {pathname} failed ({e}); reconnecting", flush=True)
+            self._force_reconnect(ws)
         return False
+
+    def _force_reconnect(self, ws) -> None:
+        self._ws_ready.clear()
+        try:
+            ws.disconnect()
+        except Exception:
+            pass
 
     def _resync_doc(self, doc_id: str, ws) -> None:
         """Re-join doc_id and merge the local file onto the server content."""
@@ -1009,9 +1075,33 @@ class OverleafSync:
 
         ws = TrackingSocketIOClient(session, self.project_id)
         ws.on("otUpdateApplied", self._on_ot_update)
+        ws.on_handler_error = lambda name, exc: self._force_reconnect(ws)
         ws.connect()
         ws.run_forever()
+        try:
+            self._sync_all_docs(ws, initial)
+        except BaseException:
+            try:
+                ws.disconnect()
+            except Exception:
+                pass
+            raise
+        self._ws = ws
+        self._ws_ready_at = _time.monotonic()
+        self._ws_ready.set()
+
+    def _backup_local(self, pathname: str, content: str) -> None:
+        """Keep a copy of a local file we are about to overwrite with the server's."""
+        dest = self.output_dir / ".overleaf-sync-backup" / self._started / pathname
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        print(f"  {_ts()} [sync] local {pathname} differed from Overleaf; "
+              f"backup in {dest}", flush=True)
+
+    def _sync_all_docs(self, ws, initial: bool) -> None:
         project_data = ws.join_project()
+        if not project_data:
+            raise RuntimeError("joinProject returned nothing")
         self._public_id = project_data.pop("_public_id", None) or ""
         docs = collect_docs_from_project(project_data)
         if not docs:
@@ -1059,13 +1149,16 @@ class OverleafSync:
                         out_path.write_text(merged, encoding="utf-8")
                         print(f"  {_ts()} [sync] merged local edits for {pathname}", flush=True)
                     continue
+            if initial and out_path.exists():
+                try:
+                    previous = out_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    previous = None
+                if previous is not None and previous != server_content:
+                    self._backup_local(pathname, previous)
             out_path.write_text(server_content, encoding="utf-8")
             if initial:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
-
-        self._ws = ws
-        self._ws_ready_at = _time.monotonic()
-        self._ws_ready.set()
 
     # -- startup --------------------------------------------------------------
 

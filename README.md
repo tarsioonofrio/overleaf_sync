@@ -40,6 +40,15 @@ While a coauthor types, their ops are merged into the local file, never written 
 - 📤 A local change is sent as one `applyOtUpdate`; it is acknowledged by its stripped `{v, doc}` echo, not by the callback (which only means "queued"). One in flight per doc.
 - 🔁 If the push is rejected or never echoed: re-join the doc and 3-way merge the local file onto the server content.
 
+## Safeguards against destroying the server document
+
+- 🕐 A local change is pushed only after the file has had the same content on two consecutive polls, so a half-written (truncated) save is never sent.
+- 🛑 A change that empties the file or removes more than half of a 200+ char doc is held until the file is stable for 5 s.
+- ❌ `joinDoc` timeouts/errors raise instead of looking like an empty doc (which would be merged as "server deleted everything").
+- 🔀 A version gap in incoming updates, or an exception in the update handler, drops the socket; the reconnect path re-joins and 3-way merges instead of pushing from a stale copy.
+- 💾 At startup, a local file that differs from Overleaf is copied to `<dir>/.overleaf-sync-backup/<timestamp>/` before being overwritten.
+- Overleaf itself rejects a delete whose text does not match the document, and keeps full history (restore from Overleaf's History if needed).
+
 ## Reconnect invariants (data-loss prevention)
 
 These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
