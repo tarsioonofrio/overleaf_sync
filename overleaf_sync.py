@@ -400,6 +400,33 @@ def apply_sharejs_ops(content: str, ops: list[dict]) -> str:
     return content
 
 
+def apply_ops_strict(content: str, ops) -> str:
+    """
+    apply_sharejs_ops for ops that come from the server: anything that does not
+    fit the document we hold (bad position or type, a delete whose text is not
+    there) means our copy and the server's have diverged, so raise and let the
+    caller resync instead of guessing.  Ops without i/d (comment ops) are skipped.
+    """
+    if not isinstance(ops, list):
+        raise ValueError(f"ops is not a list: {type(ops).__name__}")
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ValueError("op is not an object")
+        p = op.get("p")
+        if type(p) is not int or not 0 <= p <= len(content):
+            raise ValueError(f"bad op position {p!r} in a {len(content)}-char doc")
+        if "i" in op:
+            if not isinstance(op["i"], str):
+                raise ValueError("insert text is not a string")
+            content = content[:p] + op["i"] + content[p:]
+        elif "d" in op:
+            d = op["d"]
+            if not isinstance(d, str) or content[p:p + len(d)] != d:
+                raise ValueError("delete text does not match the document")
+            content = content[:p] + content[p + len(d):]
+    return content
+
+
 # Overleaf (ShareJS in JS) counts positions in UTF-16 code units; Python str
 # indexes code points.  They differ after any char outside the BMP (emoji,
 # some math symbols).  compute_ot_ops / apply_sharejs_ops work in code points;
@@ -446,11 +473,18 @@ def apply_wire_ops(content: str, ops: list[dict]) -> str:
 
 def wire_to_cp(content: str, ops: list[dict]) -> list[dict]:
     """Convert server ops (UTF-16 positions, applied sequentially) to code points."""
+    if not isinstance(ops, list):
+        raise ValueError(f"ops is not a list: {type(ops).__name__}")
     out = []
     for op in ops:
-        cp_op = {**op, "p": _utf16_to_cp(content, op["p"])}
+        if not isinstance(op, dict):
+            raise ValueError("op is not an object")
+        p16 = op.get("p")
+        if type(p16) is not int or not 0 <= p16 <= len(content.encode("utf-16-le", "surrogatepass")) // 2:
+            raise ValueError(f"bad op position {p16!r}")
+        cp_op = {**op, "p": _utf16_to_cp(content, p16)}
         out.append(cp_op)
-        content = apply_sharejs_ops(content, [cp_op])
+        content = apply_ops_strict(content, [cp_op])
     return out
 
 
@@ -1040,26 +1074,38 @@ class OverleafSync:
                     f"{state['path']}: update gap (got v{v}, expected v{state['version']})"
                 )
             inflight = state.get("inflight")
-            base = inflight["base"] if inflight else state["content"]
-            remote = wire_to_cp(base, ops)
-            if inflight:
-                inflight["base"] = apply_sharejs_ops(base, remote)
-                inflight["ops"], remote = transform_x(inflight["ops"], remote)
-            old_content = state["content"]
-            state["content"] = apply_sharejs_ops(old_content, remote)
-            if v is not None:
-                state["version"] = v + 1
+            # If the local write below fails (disk full, permissions) the state
+            # must go back to what the file on disk still corresponds to:
+            # otherwise the reconnect would diff the old file against the new
+            # server text and push the coauthor's edit as a deletion.
+            before = (state["content"], state["version"],
+                      (list(inflight["ops"]), inflight["base"]) if inflight else None)
+            try:
+                base = inflight["base"] if inflight else state["content"]
+                remote = wire_to_cp(base, ops)
+                if inflight:
+                    inflight["base"] = apply_ops_strict(base, remote)
+                    inflight["ops"], remote = transform_x(inflight["ops"], remote)
+                old_content = state["content"]
+                state["content"] = apply_ops_strict(old_content, remote)
+                if v is not None:
+                    state["version"] = v + 1
 
-            out_path = safe_join(self.output_dir, state["path"])
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            def merge_remote(local: str) -> str:
-                if local == old_content:
-                    return state["content"]
-                local_ops = compute_ot_ops(old_content, local)
-                _, remote_t = transform_x(local_ops, remote)
-                return apply_sharejs_ops(local, remote_t)
+                out_path = safe_join(self.output_dir, state["path"])
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                def merge_remote(local: str) -> str:
+                    if local == old_content:
+                        return state["content"]
+                    local_ops = compute_ot_ops(old_content, local)
+                    _, remote_t = transform_x(local_ops, remote)
+                    return apply_sharejs_ops(local, remote_t)
 
-            _, seen = update_file(out_path, merge_remote, default=old_content)
+                _, seen = update_file(out_path, merge_remote, default=old_content)
+            except BaseException:
+                state["content"], state["version"] = before[0], before[1]
+                if inflight and before[2]:
+                    inflight["ops"], inflight["base"] = before[2]
+                raise
             note = "" if seen == old_content else ", merged with local edits"
             label = (state["path"], state["version"], _ops_summary(ops) + note)
 
@@ -1148,7 +1194,7 @@ class OverleafSync:
                         continue
                     self._push_change(doc_id, old, new)
             except Exception as e:
-                print(f"  {_ts()} [sync] poll error: {e}", flush=True)
+                self._warn_once(f"poll:{type(e).__name__}:{e}", f"poll error: {e}")
             _time.sleep(self.POLL_INTERVAL)
 
     # A save is not atomic for many tools (truncate, then write): reading in
@@ -1326,7 +1372,12 @@ class OverleafSync:
                     continue
                 sanitized = sanitize_non_bmp(fc)
                 if sanitized != fc:
-                    atomic_write(out_path, sanitized)
+                    try:
+                        atomic_write(out_path, sanitized)
+                    except OSError as e:
+                        self._warn_once(f"sanitize:{doc_id}:{e.errno}",
+                                        f"{state['path']}: cannot rewrite the file ({e}); not sending it")
+                        continue
                     print(
                         f"  {_ts()} [sync] {state['path']}: Overleaf cannot store chars outside "
                         f"the BMP (e.g. emoji); replaced them with U+FFFD U+FFFD locally",
@@ -1345,6 +1396,11 @@ class OverleafSync:
         cp_ops = compute_ot_ops(old_content, new_content)
         if not cp_ops:
             return True
+        # A deletion is only sent once its text is safely on disk (see
+        # _snapshot_before_delete); with a full disk it waits, additions still go.
+        doc = self._docs.get(doc_id)
+        if doc and not self._snapshot_before_delete(doc["path"], old_content, cp_ops):
+            return False
         done = threading.Event()
         err: list = [None]
         with self._lock:
@@ -1362,7 +1418,6 @@ class OverleafSync:
             state["content"] = new_content
 
         ops = ops_to_wire(old_content, cp_ops)
-        self._snapshot_before_delete(pathname, old_content, cp_ops)
         print(f"  {_ts()} local→overleaf  {pathname}  ({_ops_summary(ops)})", flush=True)
 
         def on_ack(data):
@@ -1405,7 +1460,7 @@ class OverleafSync:
     BIG_SNAPSHOT_CHARS = 2000      # a push deleting this much also keeps a full copy
     SNAPSHOT_MAX_FILES = 20
 
-    def _snapshot_before_delete(self, pathname: str, old_content: str, cp_ops: list[dict]) -> None:
+    def _snapshot_before_delete(self, pathname: str, old_content: str, cp_ops: list[dict]) -> bool:
         """
         Whatever goes wrong with a deletion (a stale save that overwrote a
         coauthor's text, a tool bug, a mistake), the text must stay
@@ -1415,7 +1470,7 @@ class OverleafSync:
         """
         deleted = [(o["p"], o["d"]) for o in cp_ops if "d" in o]
         if not deleted:
-            return
+            return True
         try:
             folder = self.output_dir / ".overleaf-sync-backup" / self._started
             folder.mkdir(parents=True, exist_ok=True)
@@ -1440,7 +1495,12 @@ class OverleafSync:
                 for stale in snaps[: max(0, len(snaps) - self.SNAPSHOT_MAX_FILES)]:
                     stale.unlink(missing_ok=True)
         except OSError as e:
-            print(f"  {_ts()} [sync] could not write the deletion record: {e}", flush=True)
+            self._warn_once(f"record:{e.errno}",
+                            f"could not write the deletion record ({e}); NOT deleting text in Overleaf "
+                            f"until it can be recorded (free disk space / fix permissions on "
+                            f"{self.output_dir}/.overleaf-sync-backup). Your file is untouched.")
+            return False
+        return True
 
     def _resync_doc(self, doc_id: str, ws) -> None:
         """Re-join doc_id and merge the local file onto the server content."""
@@ -1693,7 +1753,7 @@ class OverleafSync:
                         # Back off: hammering a rate-limiting server (HTTP 429)
                         # or a down one only makes the outage longer.
                         print(f"  {_ts()} [sync] reconnect failed: {e} — retrying in {retry:.0f}s", flush=True)
-                        _time.sleep(retry)
+                        _time.sleep(max(retry, getattr(e, "retry_after", None) or 0))
                         retry = min(retry * 2, 30.0)
         except KeyboardInterrupt:
             print("\nStopping...")

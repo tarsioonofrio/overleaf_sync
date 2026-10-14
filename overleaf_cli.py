@@ -89,6 +89,18 @@ configure()   # environment / default; the CLI calls it again with its own flags
 # STEP 1 & 2: Authentication + Project Bootstrap
 # ---------------------------------------------------------------------------
 
+class RateLimited(RuntimeError):
+    """HTTP 429: the server asked us to slow down; honour Retry-After when it is a number of seconds."""
+
+    def __init__(self, retry_after=None):
+        try:
+            self.retry_after = min(max(float(retry_after), 0.0), 600.0) if retry_after is not None else None
+        except (TypeError, ValueError):
+            self.retry_after = None
+        super().__init__("Overleaf is rate-limiting this client (HTTP 429)"
+                         + (f"; asked to wait {self.retry_after:.0f}s" if self.retry_after else ""))
+
+
 class AuthError(RuntimeError):
     """The session cookie was rejected (expired, logged out, or wrong)."""
 
@@ -148,6 +160,8 @@ class OverleafSession:
             )
         if resp.status_code == 404:
             raise RuntimeError(f"project {project_id} not found (or no access)")
+        if resp.status_code == 429:
+            raise RateLimited(resp.headers.get("Retry-After"))
         resp.raise_for_status()
 
         bootstrap = {}

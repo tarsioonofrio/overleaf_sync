@@ -93,13 +93,15 @@ check("5 wipe held: server intact after 3 s", len(R.text()) > 1000)
 M.write_text(keep); time.sleep(4)
 check("5 wipe cancelled: nothing was deleted on the server", R.text() == keep)
 
-# 6 offline edit -> backup on restart
+# 6 edits on both sides while the sync is stopped are merged on restart
 p.terminate(); p.wait(); time.sleep(1)
-M.write_text("OFFLINE EDIT, not on the server\n"); server_before = R.text()
-n0 = len(logtxt()); p = start_sync(); wait(lambda: "Bidirectional sync active" in logtxt()[n0:], 60); time.sleep(2)
-bk = list(OUT.glob(".overleaf-sync-backup/*/main.tex"))
-check("6 offline edit backed up on restart", bk and bk[-1].read_text() == "OFFLINE EDIT, not on the server\n")
-check("6 local restored from the server, server untouched", M.read_text() == server_before == R.text())
+M.write_text(M.read_text() + f"%% offline local edit {RUN}\n")
+R.insert_line(f"%% offline remote edit {RUN}", random.Random(2))
+n0 = len(logtxt()); p = start_sync(); wait(lambda: "Bidirectional sync active" in logtxt()[n0:], 60)
+check("6 both offline edits reach the server", wait(lambda: f"offline local edit {RUN}" in R.text() and f"offline remote edit {RUN}" in R.text(), 40))
+check("6 both offline edits are in the local file, once", wait(lambda: M.read_text() == R.text(), 30)
+      and M.read_text().count(f"offline local edit {RUN}") == 1 and M.read_text().count(f"offline remote edit {RUN}") == 1)
+check("6 the pre-merge local file was kept in the backup", any(f"offline local edit {RUN}" in b.read_text() for b in OUT.glob(".overleaf-sync-backup/*/main.tex")))
 
 # 7 restore the original content on the server through the sync
 M.write_text(ORIG)
