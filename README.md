@@ -57,6 +57,7 @@ While a coauthor types, their ops are merged into the local file, never written 
 - 💽 Disk full / no permission: if an incoming update cannot be written, the in-memory state is rolled back and the sync reconnects, so the unwritten text is never mistaken for a local deletion. A deletion is only sent after its text has been recorded in `.overleaf-sync-backup` (if that fails, the deletion waits and a warning says why; additions still go).
 - 🧾 Operations from the server are validated (position, types, and that a delete's text really is in the document); anything that does not fit means our copy diverged, so the sync reconnects instead of guessing.
 - 🐢 HTTP 429 (rate limit): reconnects back off exponentially and honour `Retry-After`.
+- 🧭 If the server announces an OT migration stage other than 0 (`ol-otMigrationStage`, Overleaf's move to a new history protocol), the sync refuses to run and says so — it was written and tested against stage 0 only. `--check` prints the stage; `--allow-unknown-protocol` overrides at your own risk.
 - 🔒 One sync per directory (lock file); a second instance exits.
 - 🔑 `--cookie-file` keeps the cookie out of `ps`/history; an expired or revoked session stops the sync with a clear error after 3 attempts (files untouched).
 - 🪢 A doc renamed or moved in Overleaf takes its local file (and pending edits) along.

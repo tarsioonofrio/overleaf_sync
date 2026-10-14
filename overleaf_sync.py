@@ -1741,6 +1741,10 @@ class OverleafSync:
                         print(f"  {_ts()} [sync] reconnected", flush=True)
                         break
                     except Exception as e:
+                        if type(e).__name__ == "UnsupportedProtocol":
+                            self._fatal = f"{e}\nLocal files are untouched."
+                            self._running = False
+                            break
                         if type(e).__name__ == "AuthError":
                             auth_failures += 1
                             if auth_failures >= 3:
@@ -1819,6 +1823,7 @@ def resolve_settings(args, cfg: dict) -> dict:
         "output_dir": str(Path(output_dir).expanduser()),
         "dry_run": args.dry_run or bool(pick("dry_run")),
         "allow_wipe": args.allow_wipe or bool(pick("allow_wipe")),
+        "allow_unknown_protocol": args.allow_unknown_protocol or bool(pick("allow_unknown_protocol")),
     }
 
 
@@ -1847,6 +1852,7 @@ def run_check(settings: dict, cookie: str) -> int:
     session = overleaf_cli.OverleafSession(cookie)
     boot = session.get_project_bootstrap(settings["project_id"])
     print(f"Logged in: yes — project \"{boot.get('ol-projectName', '?')}\"")
+    print(f"Protocol : OT migration stage {boot.get('ol-otMigrationStage', 'not announced')} (supported: 0)")
     ws = TrackingSocketIOClient(session, settings["project_id"])
     ws.connect()
     ws.run_forever()
@@ -1920,6 +1926,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--listen", action="store_true", help="one-way mirror Overleaf → local")
     parser.add_argument("--allow-wipe", action="store_true",
                         help="push a file emptied locally without asking (default: hold it until confirmed)")
+    parser.add_argument("--allow-unknown-protocol", action="store_true",
+                        help="go on even if the server announces an OT protocol stage other than 0 (unsupported, may corrupt documents)")
     parser.add_argument("--dry-run", action="store_true",
                         help="pull from Overleaf but never send local edits; log what would be sent")
 
@@ -1930,6 +1938,7 @@ def main(argv: list[str] | None = None):
     sys.path.insert(0, str(Path(__file__).parent))
     import overleaf_cli
     overleaf_cli.configure(settings["url"], settings["cookie_name"])
+    overleaf_cli.ALLOW_UNKNOWN_PROTOCOL = settings["allow_unknown_protocol"]
 
     cookie_file = settings["cookie_file"]
     cookie = args.cookie
@@ -1953,7 +1962,7 @@ def main(argv: list[str] | None = None):
     if args.check:
         try:
             sys.exit(run_check(settings, session_cookie))
-        except overleaf_cli.AuthError as e:
+        except (overleaf_cli.AuthError, overleaf_cli.UnsupportedProtocol) as e:
             sys.exit(f"Error: {e}")
     if args.listen:
         OverleafListener(

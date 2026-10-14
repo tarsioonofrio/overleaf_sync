@@ -101,6 +101,21 @@ class RateLimited(RuntimeError):
                          + (f"; asked to wait {self.retry_after:.0f}s" if self.retry_after else ""))
 
 
+class UnsupportedProtocol(RuntimeError):
+    """The server announces a real-time/OT protocol stage this client was not written or tested for."""
+
+    def __init__(self, stage):
+        self.stage = stage
+        super().__init__(
+            f"this Overleaf announces OT migration stage {stage!r}; only stage 0 (the classic "
+            f"real-time protocol) is supported, and writing with an unknown protocol could corrupt "
+            f"documents. Nothing was changed. If you accept that risk, pass --allow-unknown-protocol.")
+
+
+# Set from the CLI (--allow-unknown-protocol): downgrade UnsupportedProtocol to "go ahead anyway".
+ALLOW_UNKNOWN_PROTOCOL = False
+
+
 class AuthError(RuntimeError):
     """The session cookie was rejected (expired, logged out, or wrong)."""
 
@@ -187,6 +202,9 @@ class OverleafSession:
                 bootstrap[name] = True
 
         self._csrf_token = bootstrap.get("ol-csrfToken")
+        stage = bootstrap.get("ol-otMigrationStage")       # absent on older servers
+        if stage not in (0, None) and not ALLOW_UNKNOWN_PROTOCOL:
+            raise UnsupportedProtocol(stage)
         return bootstrap
 
     @property
