@@ -142,3 +142,95 @@ def test_dry_run_never_pushes(tmp_path):
     t.join(timeout=2)
     assert sync._docs["d1"]["content"] == "hello"
 
+
+
+# --- hostile document paths (any collaborator can name a doc) ---------------
+
+from pathlib import Path
+
+
+@pytest.mark.parametrize("rel", [
+    "../evil.tex", "a/../../evil.tex", "/etc/passwd", "a//b.tex", "./a.tex", "a/./b.tex",
+    "", "a\x00b.tex", "a\\..\\b.tex", ".overleaf-sync-backup/x.tex", "x.tex.sync-tmp",
+    "a/" + "b" * 256, "c" * 5000,
+])
+def test_unsafe_paths_rejected(rel):
+    assert not overleaf_sync.is_safe_relpath(rel)
+
+
+@pytest.mark.parametrize("rel", ["main.tex", "sub/dir/ref.bib", "ção/é.tex", "a b.tex", "..a.tex", "a..b/x.tex"])
+def test_normal_paths_accepted(rel):
+    assert overleaf_sync.is_safe_relpath(rel)
+
+
+def test_safe_join_blocks_symlink_escape(tmp_path):
+    out = tmp_path / "out"; out.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (out / "link").symlink_to(outside)
+    with pytest.raises(ValueError):
+        overleaf_sync.safe_join(out, "link/x.tex")
+    (out / "flink.tex").symlink_to(outside / "secret.tex")
+    with pytest.raises(ValueError):
+        overleaf_sync.safe_join(out, "flink.tex")
+    assert overleaf_sync.safe_join(out, "ok/x.tex") == out / "ok/x.tex"
+
+
+def test_filter_drops_unsafe_and_case_collisions(capsys):
+    docs = {"1": "main.tex", "2": "../x.tex", "3": "Main.tex", "4": "sub/a.tex"}
+    assert overleaf_sync.filter_safe_docs(docs) == {"3": "Main.tex", "4": "sub/a.tex"}
+
+
+def test_symlinked_file_is_not_read_or_pushed(tmp_path):
+    out = tmp_path / "out"; out.mkdir()
+    secret = tmp_path / "secret.txt"; secret.write_text("TOP SECRET")
+    (out / "main.tex").symlink_to(secret)
+    sync = OverleafSync("pid", "cookie", str(out))
+    sync._docs["d1"] = {"content": "abc", "version": 1, "path": "main.tex"}
+    assert sync._collect_local_changes() == []
+    assert secret.read_text() == "TOP SECRET"
+
+
+# --- update_file: never overwrite an editor save that races the merge -------
+
+def test_update_file_preserves_write_that_lands_during_merge(tmp_path):
+    p = tmp_path / "main.tex"
+    p.write_text("base")
+    calls = []
+
+    def fn(local):
+        calls.append(local)
+        if len(calls) == 1:                      # editor saves while we compute
+            tmp = tmp_path / ".swp"
+            tmp.write_text("base + EDITOR TOKEN")
+            tmp.replace(p)
+        return local + " + REMOTE"
+
+    new, seen = overleaf_sync.update_file(p, fn)
+    assert calls == ["base", "base + EDITOR TOKEN"]
+    assert p.read_text() == "base + EDITOR TOKEN + REMOTE" == new
+    assert seen == "base + EDITOR TOKEN"
+    assert [f.name for f in tmp_path.iterdir()] == ["main.tex"]
+
+
+def test_update_file_creates_missing_file_from_default(tmp_path):
+    p = tmp_path / "new.tex"
+    overleaf_sync.update_file(p, lambda local: local + "!", default="abc")
+    assert p.read_text() == "abc!"
+
+
+def test_update_file_missing_without_default_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        overleaf_sync.update_file(tmp_path / "nope.tex", lambda t: t)
+
+
+def test_update_file_noop_does_not_touch_file(tmp_path):
+    p = tmp_path / "a.tex"; p.write_text("same")
+    ino = p.stat().st_ino
+    overleaf_sync.update_file(p, lambda t: t)
+    assert p.stat().st_ino == ino
+
+
+def test_update_file_keeps_permissions(tmp_path):
+    p = tmp_path / "a.tex"; p.write_text("x"); p.chmod(0o640)
+    overleaf_sync.update_file(p, lambda t: t + "y")
+    assert p.read_text() == "xy" and (p.stat().st_mode & 0o777) == 0o640

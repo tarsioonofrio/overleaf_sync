@@ -269,62 +269,136 @@ def load_overleaf_cookie(
 # OT helpers
 # ---------------------------------------------------------------------------
 
+def _common_prefix(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _common_suffix(a: str, b: str, limit: int) -> int:
+    n = min(len(a), len(b), limit)
+    i = 0
+    while i < n and a[len(a) - 1 - i] == b[len(b) - 1 - i]:
+        i += 1
+    return i
+
+
+def _lis(seq: list[int]) -> list[int]:
+    """Indices of a longest strictly increasing subsequence of seq."""
+    import bisect
+    tails: list[int] = []      # tails[k]: index in seq ending the best run of length k+1
+    prev = [-1] * len(seq)
+    for i, x in enumerate(seq):
+        k = bisect.bisect_left(tails, x, key=lambda t: seq[t])
+        if k > 0:
+            prev[i] = tails[k - 1]
+        if k == len(tails):
+            tails.append(i)
+        else:
+            tails[k] = i
+    out = []
+    i = tails[-1] if tails else -1
+    while i >= 0:
+        out.append(i)
+        i = prev[i]
+    return out[::-1]
+
+
+def _line_hunks(A: list[str], B: list[str], depth: int = 0) -> list[tuple[int, int, int, int]]:
+    """
+    Patience diff on lines: anchor on lines that occur exactly once on both
+    sides, keep the longest in-order chain of anchors, and recurse into the
+    gaps.  Returns (a1, a2, b1, b2) hunks, ascending.  Unlike one coarse block
+    from the first to the last change, edits far apart stay separate hunks, so
+    a concurrent edit between them is not dragged to a block edge.
+    """
+    hunks: list[tuple[int, int, int, int]] = []
+
+    def go(a1: int, a2: int, b1: int, b2: int, depth: int) -> None:
+        while a1 < a2 and b1 < b2 and A[a1] == B[b1]:
+            a1 += 1; b1 += 1
+        while a1 < a2 and b1 < b2 and A[a2 - 1] == B[b2 - 1]:
+            a2 -= 1; b2 -= 1
+        if a1 == a2 and b1 == b2:
+            return
+        if a1 == a2 or b1 == b2 or depth > 40:
+            hunks.append((a1, a2, b1, b2))
+            return
+        count_a: dict[str, int] = {}
+        for i in range(a1, a2):
+            count_a[A[i]] = count_a.get(A[i], 0) + 1
+        count_b: dict[str, int] = {}
+        pos_b: dict[str, int] = {}
+        for j in range(b1, b2):
+            count_b[B[j]] = count_b.get(B[j], 0) + 1
+            pos_b[B[j]] = j
+        pairs = [(i, pos_b[A[i]]) for i in range(a1, a2)
+                 if count_a[A[i]] == 1 and count_b.get(A[i]) == 1]
+        if not pairs:
+            hunks.append((a1, a2, b1, b2))
+            return
+        chain = [pairs[k] for k in _lis([p[1] for p in pairs])]
+        ci, cj = a1, b1
+        for i, j in chain:
+            go(ci, i, cj, j, depth + 1)
+            ci, cj = i + 1, j + 1
+        go(ci, a2, cj, b2, depth + 1)
+
+    go(0, len(A), 0, len(B), depth)
+    return hunks
+
+
 def compute_ot_ops(old: str, new: str) -> list[dict]:
     """
     Diff old → new and return a list of ShareJS ops in reverse position order
     so they can be applied sequentially without shifting offsets.
+
+    Separate changes become separate ops (line-level patience diff, then
+    char-level trimming inside each hunk): the ops of one hunk never cover the
+    unchanged text between it and the next, so a concurrent remote edit there
+    keeps its place when the ops are transformed.
     """
     if old == new:
         return []
 
-    # Fast path for the common case in editor sync: one contiguous edit inside
-    # a large document. This avoids SequenceMatcher's pathological latency on
-    # near-identical long strings.
-    prefix = 0
-    max_prefix = min(len(old), len(new))
-    while prefix < max_prefix and old[prefix] == new[prefix]:
-        prefix += 1
+    prefix = _common_prefix(old, new)
+    suffix = _common_suffix(old[prefix:], new[prefix:], min(len(old), len(new)) - prefix)
+    old_end, new_end = len(old) - suffix, len(new) - suffix
+    old_mid, new_mid = old[prefix:old_end], new[prefix:new_end]
 
-    old_suffix_idx = len(old)
-    new_suffix_idx = len(new)
-    while (
-        old_suffix_idx > prefix
-        and new_suffix_idx > prefix
-        and old[old_suffix_idx - 1] == new[new_suffix_idx - 1]
-    ):
-        old_suffix_idx -= 1
-        new_suffix_idx -= 1
+    # Hunks as (old_start, old_text, new_text), ascending, in old coordinates.
+    spans: list[tuple[int, str, str]] = []
+    if "\n" in old_mid or "\n" in new_mid:
+        A = old_mid.splitlines(keepends=True)
+        B = new_mid.splitlines(keepends=True)
+        offs = [0]
+        for line in A:
+            offs.append(offs[-1] + len(line))
+        boffs = [0]
+        for line in B:
+            boffs.append(boffs[-1] + len(line))
+        for a1, a2, b1, b2 in _line_hunks(A, B):
+            o, n = old_mid[offs[a1]:offs[a2]], new_mid[boffs[b1]:boffs[b2]]
+            p = _common_prefix(o, n)
+            q = _common_suffix(o[p:], n[p:], min(len(o), len(n)) - p)
+            o_t, n_t = o[p:len(o) - q], n[p:len(n) - q]
+            if o_t or n_t:
+                spans.append((prefix + offs[a1] + p, o_t, n_t))
+    else:
+        spans.append((prefix, old_mid, new_mid))
 
-    old_mid = old[prefix:old_suffix_idx]
-    new_mid = new[prefix:new_suffix_idx]
-    if old_mid or new_mid:
-        # Ops are sent to Overleaf one at a time; each op sees the document
-        # state left by the previous one.  For a replace (delete + insert at
-        # the same position) the delete MUST execute before the insert: if the
-        # insert runs first, the cursor lands on the newly-inserted text and
-        # the subsequent delete corrupts it instead of removing the old text.
-        # We build the list with insert before delete so that reversing it
-        # yields [delete, insert] — highest position first, delete before
-        # insert within the same position.
-        ops = []
-        if new_mid:
-            ops.append({"p": prefix, "i": new_mid})
-        if old_mid:
-            ops.append({"p": prefix, "d": old_mid})
-        return list(reversed(ops))
-
-    ops = []
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        if tag == "insert":
-            ops.append({"p": i1, "i": new[j1:j2]})
-        elif tag == "delete":
-            ops.append({"p": i1, "d": old[i1:i2]})
-        elif tag == "replace":
-            ops.append({"p": i1, "i": new[j1:j2]})
-            ops.append({"p": i1, "d": old[i1:i2]})
+    # Within one hunk the delete must run before the insert: if the insert ran
+    # first, the cursor would land on the new text and the delete would remove
+    # it instead of the old text.  Built as [insert, delete] per hunk, then
+    # reversed so positions descend and delete precedes insert.
+    ops: list[dict] = []
+    for start, o_t, n_t in spans:
+        if n_t:
+            ops.append({"p": start, "i": n_t})
+        if o_t:
+            ops.append({"p": start, "d": o_t})
     return list(reversed(ops))
 
 
@@ -491,6 +565,39 @@ def transform_x(left: list[dict], right: list[dict]) -> tuple[list[dict], list[d
     return left, new_right
 
 
+MIN_EVIDENCE_CHARS = 8
+
+
+def inflight_already_applied(inflight: dict, server_content: str, server_version: int) -> bool:
+    """
+    After a reconnect, did the server already apply our un-echoed op?
+
+    The server can apply it and the connection drop before the echo reaches
+    us.  Re-pushing then duplicates the text on the server, so the merge must
+    start from the post-op content instead.  Evidence required: the server
+    moved past the version we sent at, and every component of the op shows
+    up in the server's text (an inserted string occurs more often than in the
+    pre-op text, a deleted one less often).  Tiny components are ambiguous
+    (they occur everywhere), so they never count as evidence.
+    """
+    v_sent = inflight.get("v")
+    if v_sent is not None and server_version <= v_sent:
+        return False
+    base = inflight["base"]
+    evidence = False
+    for op in inflight["ops"]:
+        if "i" in op:
+            text, more = op["i"], server_content.count(op["i"]) > base.count(op["i"])
+        else:
+            text, more = op["d"], server_content.count(op["d"]) < base.count(op["d"])
+        if len(text) < MIN_EVIDENCE_CHARS:
+            continue
+        if not more:
+            return False
+        evidence = True
+    return evidence
+
+
 def merge3(base: str, mine: str, theirs: str) -> str:
     """3-way merge: apply both base→mine and base→theirs edits."""
     mine_ops = compute_ot_ops(base, mine)
@@ -588,6 +695,52 @@ class TrackingSocketIOClient:
 # Project doc-tree helpers
 # ---------------------------------------------------------------------------
 
+def is_safe_relpath(rel: str) -> bool:
+    """
+    A doc path comes from the server (any collaborator can name a doc), so it
+    must never be able to point outside the sync directory.
+    """
+    if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/"):
+        return False
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    if any(p.startswith(".overleaf-sync-backup") or p.endswith(".sync-tmp") for p in parts):
+        return False
+    return len(rel.encode("utf-8", "surrogatepass")) < 4096 and all(
+        len(p.encode("utf-8", "surrogatepass")) <= 255 for p in parts
+    )
+
+
+def safe_join(root: Path, rel: str) -> Path:
+    """root / rel, refusing anything that resolves (symlinks included) outside root."""
+    if not is_safe_relpath(rel):
+        raise ValueError(f"unsafe document path {rel!r}")
+    real_root = os.path.realpath(root)
+    target = root / rel
+    if os.path.commonpath([real_root, os.path.realpath(target)]) != real_root:
+        raise ValueError(f"{rel!r} resolves outside {root}")
+    return target
+
+
+def filter_safe_docs(docs: dict[str, str]) -> dict[str, str]:
+    """Drop docs with unsafe paths or paths that collide on case-insensitive disks."""
+    out: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for doc_id, rel in sorted(docs.items(), key=lambda x: x[1]):
+        if not is_safe_relpath(rel):
+            print(f"  [sync] ignoring document with unsafe path {rel!r}", flush=True)
+            continue
+        key = rel.casefold()
+        if key in seen:
+            print(f"  [sync] ignoring {rel!r}: path collides with {seen[key]!r} "
+                  f"on case-insensitive filesystems", flush=True)
+            continue
+        seen[key] = rel
+        out[doc_id] = rel
+    return out
+
+
 def collect_docs_from_project(project_data: dict) -> dict[str, str]:
     """
     Extract {doc_id: pathname} by walking the rootFolder tree returned by
@@ -624,6 +777,85 @@ def atomic_write(path: Path, text: str) -> None:
     except FileNotFoundError:
         pass
     os.replace(tmp, path)
+
+
+def _exchange(a: Path, b: Path) -> bool:
+    """Atomically swap two paths (Linux renameat2 RENAME_EXCHANGE). False if unsupported."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        AT_FDCWD, RENAME_EXCHANGE = -100, 2
+        return libc.renameat2(AT_FDCWD, os.fsencode(a), AT_FDCWD, os.fsencode(b), RENAME_EXCHANGE) == 0
+    except (OSError, AttributeError):
+        return False
+
+
+def _sig(path: Path):
+    st = os.stat(path)
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def update_file(path: Path, fn, default: str | None = None) -> tuple[str, str]:
+    """
+    Replace `path` with fn(current text) without ever discarding a concurrent
+    write by an editor.  Reading the file, computing, then renaming leaves a
+    window in which an editor save would be silently overwritten.  Instead the
+    new file is swapped in atomically (RENAME_EXCHANGE), which hands back
+    exactly what was in `path`.  If that is not what fn saw, the editor wrote
+    in between: the swap is undone at once (so the editor's text is back in
+    place within microseconds, not after a whole merge) and the merge is
+    redone on top of what it wrote.
+
+    fn must be pure.  `default` stands in for a missing file.  Returns
+    (text now in the file, text of the file fn last merged).  Limitation: an
+    editor that keeps the old file descriptor open across saves writes into
+    the replaced inode; no rename-based writer can see that.
+    """
+    tmp = path.with_name(f".{path.name}.sync-tmp")
+
+    def snapshot():
+        for _ in range(20):
+            try:
+                before = _sig(path)
+                text = path.read_text(encoding="utf-8")
+                if _sig(path) == before:
+                    return text, before
+            except FileNotFoundError:
+                if default is None:
+                    raise
+                return default, None
+        raise RuntimeError(f"{path.name} kept changing while merging")
+
+    basis, sig0 = snapshot()
+    for _ in range(50):
+        new = fn(basis)
+        if sig0 is not None and new == basis:
+            return new, basis
+        tmp.write_text(new, encoding="utf-8")
+        if sig0 is None:                       # file missing: just create it
+            os.replace(tmp, path)
+            return new, basis
+        shutil.copymode(path, tmp)
+        if not _exchange(tmp, path):
+            # No atomic exchange (non-Linux): best effort, re-check then replace.
+            if path.read_text(encoding="utf-8") == basis:
+                os.replace(tmp, path)
+                return new, basis
+            tmp.unlink(missing_ok=True)
+            basis, sig0 = snapshot()
+            continue
+        # tmp now holds what was in `path`
+        changed = _sig(tmp) != sig0
+        if not changed:
+            changed = tmp.read_text(encoding="utf-8") != basis
+        if not changed:
+            tmp.unlink()
+            return new, basis
+        _exchange(tmp, path)                   # put the editor's file back at once
+        tmp.unlink(missing_ok=True)
+        basis, sig0 = snapshot()
+    tmp.unlink(missing_ok=True)
+    raise RuntimeError(f"{path.name} kept changing while merging")
 
 
 def _ts() -> str:
@@ -676,7 +908,7 @@ class OverleafListener:
                 state["content"] = apply_wire_ops(state["content"], ops)
             if v is not None:
                 state["version"] = v + 1
-            out_path = self.output_dir / state["path"]
+            out_path = safe_join(self.output_dir, state["path"])
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(state["content"], encoding="utf-8")
             label = (state["path"], state["version"], _ops_summary(ops))
@@ -696,7 +928,7 @@ class OverleafListener:
         self._ws.connect()
         self._ws.run_forever()
         project_data = self._ws.join_project()
-        docs = collect_docs_from_project(project_data)
+        docs = filter_safe_docs(collect_docs_from_project(project_data))
 
         if not docs:
             print("Error: no documents found in project.")
@@ -710,7 +942,7 @@ class OverleafListener:
             content = "\n".join(lines)
             with self._lock:
                 self._docs[doc_id] = {"content": content, "version": version, "path": pathname}
-            out_path = self.output_dir / pathname
+            out_path = safe_join(self.output_dir, pathname)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(content, encoding="utf-8")
             print(f"  {pathname:<45} v{version}  ({len(content)} chars)")
@@ -838,30 +1070,17 @@ class OverleafSync:
             if v is not None:
                 state["version"] = v + 1
 
-            out_path = self.output_dir / state["path"]
+            out_path = safe_join(self.output_dir, state["path"])
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            # An editor may save between our read and our replace; re-read
-            # right before replacing and redo the merge if the file moved.
-            for _ in range(10):
-                try:
-                    local = out_path.read_text(encoding="utf-8")
-                except FileNotFoundError:
-                    local = old_content
+            def merge_remote(local: str) -> str:
                 if local == old_content:
-                    merged, note = state["content"], ""
-                else:
-                    local_ops = compute_ot_ops(old_content, local)
-                    _, remote_t = transform_x(local_ops, remote)
-                    merged, note = apply_sharejs_ops(local, remote_t), ", merged with local edits"
-                try:
-                    unchanged = out_path.read_text(encoding="utf-8") == local
-                except FileNotFoundError:
-                    unchanged = local == old_content
-                if unchanged:
-                    break
-            else:
-                raise RuntimeError(f"{state['path']} kept changing while merging")
-            atomic_write(out_path, merged)
+                    return state["content"]
+                local_ops = compute_ot_ops(old_content, local)
+                _, remote_t = transform_x(local_ops, remote)
+                return apply_sharejs_ops(local, remote_t)
+
+            _, seen = update_file(out_path, merge_remote, default=old_content)
+            note = "" if seen == old_content else ", merged with local edits"
             label = (state["path"], state["version"], _ops_summary(ops) + note)
 
         print(f"  {_ts()} overleaf→local  {label[0]}  v{label[1]}  ({label[2]})")
@@ -1007,10 +1226,13 @@ class OverleafSync:
             for doc_id, state in list(self._docs.items()):
                 if state.get("inflight"):
                     continue  # push already running for this doc
-                out_path = self.output_dir / state["path"]
                 try:
+                    out_path = safe_join(self.output_dir, state["path"])
                     fc = out_path.read_text(encoding="utf-8")
                 except FileNotFoundError:
+                    continue
+                except ValueError as e:
+                    self._warn_once(f"unsafe:{state['path']}", f"not syncing {state['path']}: {e}")
                     continue
                 if fc == state["content"]:
                     continue
@@ -1048,7 +1270,7 @@ class OverleafSync:
                 return False
             pathname = state["path"]
             v = state["version"]
-            state["inflight"] = {"ops": cp_ops, "base": old_content, "done": done}
+            state["inflight"] = {"ops": cp_ops, "base": old_content, "done": done, "v": v}
             state["content"] = new_content
 
         ops = ops_to_wire(old_content, cp_ops)
@@ -1101,14 +1323,14 @@ class OverleafSync:
             # Merge from before the failed op, so it is re-pushed if the
             # server lacks it.
             base = inflight["base"] if inflight else state["content"]
-            out_path = self.output_dir / state["path"]
-            try:
-                local = out_path.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                local = state["content"]
+            if inflight and inflight_already_applied(inflight, server_content, new_v):
+                base = state["content"]    # the server already has our op
+            out_path = safe_join(self.output_dir, state["path"])
+            previous_content = state["content"]
             state["content"] = server_content
             state["version"] = new_v
-            atomic_write(out_path, merge3(base, local, server_content))
+            update_file(out_path, lambda local: merge3(base, local, server_content),
+                        default=previous_content)
         print(f"  [sync] re-synced to server v{new_v}, local edits kept", flush=True)
 
     def _disconnect_ws(self):
@@ -1174,11 +1396,18 @@ class OverleafSync:
         if not project_data:
             raise RuntimeError("joinProject returned nothing")
         self._public_id = project_data.pop("_public_id", None) or ""
-        docs = collect_docs_from_project(project_data)
+        docs = filter_safe_docs(collect_docs_from_project(project_data))
         if not docs:
             raise RuntimeError("no documents found in project")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        for doc_id, rel in list(docs.items()):
+            try:
+                safe_join(self.output_dir, rel)
+            except ValueError as e:
+                print(f"  {_ts()} [sync] ignoring {rel}: {e}", flush=True)
+                del docs[doc_id]
 
         with self._lock:
             for gone in [d for d in self._docs if d not in docs]:
@@ -1189,7 +1418,7 @@ class OverleafSync:
         for doc_id, pathname in sorted(docs.items(), key=lambda x: x[1]):
             lines, version = ws.join_doc(doc_id)
             server_content = "\n".join(lines)
-            out_path = self.output_dir / pathname
+            out_path = safe_join(self.output_dir, pathname)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
                 # Save the pre-disconnect content BEFORE overwriting it with
@@ -1200,6 +1429,8 @@ class OverleafSync:
                 # before it so it is re-pushed rather than silently dropped.
                 inflight = old_state.get("inflight")
                 merge_base = inflight["base"] if inflight else old_content
+                if inflight and inflight_already_applied(inflight, server_content, version):
+                    merge_base = old_content    # the server already has our op
 
                 self._docs[doc_id] = {
                     "content": server_content,
@@ -1207,24 +1438,32 @@ class OverleafSync:
                     "path": pathname,
                 }
             if not initial and out_path.exists():
-                local_content = out_path.read_text(encoding="utf-8")
-                if local_content != server_content:
+                branch: list[str] = []
+
+                def reconcile(local_content: str) -> str:
+                    branch.clear()
+                    if local_content == server_content:
+                        return server_content
                     if old_content is not None and local_content == old_content and not inflight:
                         # Local file is stale — identical to the last synced state
                         # before the disconnect.  Overwrite with the latest server
                         # content; do NOT push old content to Overleaf.
-                        atomic_write(out_path, server_content)
+                        branch.append("stale")
+                        return server_content
+                    # Local has genuine edits relative to the pre-disconnect
+                    # state (or old_content is unknown).  Merge them on top of
+                    # the server content so no edits are lost.  In-memory state
+                    # stays server_content, so the poll loop diffs
+                    # (server → merged) and pushes to Overleaf.
+                    branch.append("merge")
+                    return merge3(merge_base or "", local_content, server_content)
+
+                _, seen = update_file(out_path, reconcile)
+                if seen != server_content:
+                    if branch == ["stale"]:
                         print(f"  {_ts()} [sync] stale local {pathname} → updated to v{version}", flush=True)
                     else:
-                        # Local has genuine edits relative to the pre-disconnect
-                        # state (or old_content is unknown).  Merge them on top
-                        # of the server content so no edits are lost.
-                        print(f"  {_ts()} [sync] local edit pending on {pathname} — merging...", flush=True)
-                        merged = merge3(merge_base or "", local_content, server_content)
-                        # Keep in-memory state = server_content so the poll loop
-                        # will diff (server → merged) and push to Overleaf.
-                        atomic_write(out_path, merged)
-                        print(f"  {_ts()} [sync] merged local edits for {pathname}", flush=True)
+                        print(f"  {_ts()} [sync] local edit pending on {pathname} — merged", flush=True)
                     continue
             if initial and out_path.exists():
                 try:
