@@ -1,0 +1,8 @@
+requests
+websocket-client
+
+[e2e]
+selenium
+
+[test]
+pytest

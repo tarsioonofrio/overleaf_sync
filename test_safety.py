@@ -278,3 +278,22 @@ def test_login_redirect_is_reported_as_auth_error(monkeypatch):
     monkeypatch.setattr(s.session, "get", lambda *a, **k: Resp())
     with pytest.raises(AuthError):
         s.get_project_bootstrap("1")
+
+
+def test_cookie_domain_for_dotless_hosts():
+    from overleaf_cli import _cookie_domain
+    assert _cookie_domain("localhost") == "localhost.local"
+    assert _cookie_domain("overleaf") == "overleaf.local"
+    assert _cookie_domain("www.overleaf.com") == "www.overleaf.com"
+    assert _cookie_domain("127.0.0.1") == "127.0.0.1"
+
+
+def test_session_cookie_is_sent_to_localhost():
+    import overleaf_cli
+    overleaf_cli.configure("http://localhost:8080")
+    try:
+        s = overleaf_cli.OverleafSession("s%3Aabc")
+        req = s.session.prepare_request(__import__("requests").Request("GET", "http://localhost:8080/project/1"))
+        assert "overleaf.sid=s%3Aabc" in req.headers.get("Cookie", "")
+    finally:
+        overleaf_cli.configure()

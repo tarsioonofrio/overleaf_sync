@@ -41,13 +41,48 @@ from typing import Optional
 import requests
 import websocket  # pip install websocket-client
 
-# Point OVERLEAF_URL at a self-hosted instance (e.g. http://localhost:8080) to
-# test against it; OVERLEAF_COOKIE_NAME is the session cookie there (CE uses
-# "overleaf.sid").
-BASE_URL = os.environ.get("OVERLEAF_URL", "https://www.overleaf.com").rstrip("/")
-COOKIE_NAME = os.environ.get("OVERLEAF_COOKIE_NAME", "overleaf_session2")
-_HOST = urllib.parse.urlparse(BASE_URL).hostname or "www.overleaf.com"
-WS_BASE = ("wss" if BASE_URL.startswith("https") else "ws") + "://" + BASE_URL.split("://", 1)[1]
+DEFAULT_URL = "https://www.overleaf.com"
+BASE_URL = DEFAULT_URL
+COOKIE_NAME = "overleaf_session2"
+_HOST = "www.overleaf.com"
+WS_BASE = "wss://www.overleaf.com"
+
+
+def default_cookie_name(url: str) -> str:
+    """overleaf.com names its session cookie overleaf_session2; Community/Server Pro use overleaf.sid."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    return "overleaf_session2" if host == "overleaf.com" or host.endswith(".overleaf.com") else "overleaf.sid"
+
+
+def configure(url: Optional[str] = None, cookie_name: Optional[str] = None) -> None:
+    """
+    Point the client at an Overleaf instance (overleaf.com, Community Edition,
+    Server Pro, an institutional install).  Falls back to OVERLEAF_URL /
+    OVERLEAF_COOKIE_NAME, then to overleaf.com.
+    """
+    global BASE_URL, COOKIE_NAME, _HOST, WS_BASE
+    url = (url or os.environ.get("OVERLEAF_URL") or DEFAULT_URL).rstrip("/")
+    if "://" not in url:
+        url = "https://" + url
+    BASE_URL = url
+    COOKIE_NAME = cookie_name or os.environ.get("OVERLEAF_COOKIE_NAME") or default_cookie_name(url)
+    _HOST = urllib.parse.urlparse(url).hostname or "www.overleaf.com"
+    WS_BASE = ("wss" if url.startswith("https") else "ws") + "://" + url.split("://", 1)[1]
+
+
+def _cookie_domain(host: str) -> str:
+    """requests files cookies for dot-less hosts (localhost, intranet names) under "<host>.local"."""
+    import ipaddress
+    if "." in host or ":" in host:
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return host + ".local"
+
+
+configure()   # environment / default; the CLI calls it again with its own flags
 
 
 # ---------------------------------------------------------------------------
@@ -58,13 +93,33 @@ class AuthError(RuntimeError):
     """The session cookie was rejected (expired, logged out, or wrong)."""
 
 
+def login_with_password(email: str, password: str) -> str:
+    """
+    Log in to a Community Edition / Server Pro instance with e-mail and
+    password and return the session cookie value.  overleaf.com cannot be
+    used this way (captcha / SSO): take its cookie from the browser.
+    """
+    s = requests.Session()
+    page = s.get(f"{BASE_URL}/login")
+    page.raise_for_status()
+    m = re.search(r'name="ol-csrfToken"[^>]*content="([^"]*)"', page.text)
+    if not m:
+        raise AuthError("could not find the login form's CSRF token")
+    token = html.unescape(m.group(1))
+    r = s.post(f"{BASE_URL}/login", json={"email": email, "password": password, "_csrf": token},
+               headers={"X-Csrf-Token": token})
+    if r.status_code != 200 or COOKIE_NAME not in s.cookies:
+        raise AuthError(f"login failed (HTTP {r.status_code}); check e-mail/password")
+    return s.cookies[COOKIE_NAME]
+
+
 class OverleafSession:
     """Manages auth and extracts bootstrap data from Overleaf project page."""
 
     def __init__(self, session_cookie: str):
         self.session = requests.Session()
         # The only required cookie for auth is overleaf_session2
-        self.session.cookies.set(COOKIE_NAME, session_cookie, domain=_HOST)
+        self.session.cookies.set(COOKIE_NAME, session_cookie, domain=_cookie_domain(_HOST))
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible; overleaf-cli/1.0)",
             "Origin": BASE_URL,

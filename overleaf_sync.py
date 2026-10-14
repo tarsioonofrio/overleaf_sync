@@ -1,85 +1,25 @@
 #!/usr/bin/env python3
 """
-overleaf_agent.py — Interactive REPL for live-editing Overleaf papers with an LLM
-==================================================================================
+overleaf-sync — live two-way sync between an Overleaf project and a local folder
+================================================================================
 
-HOW TO USE IN AN AGENT SESSION
-------------------------------
+Works with overleaf.com and with self-hosted Overleaf (Community Edition,
+Server Pro, institutional installs).  Any editor or coding agent that reads and
+writes the files can take part: changes are detected by polling the files, and
+Overleaf's real-time (ShareJS / operational transformation) protocol is spoken
+directly, so a coauthor typing in the browser is merged, not overwritten.
 
-1. Resolve your session cookie:
-   By default the script reads `overleaf_session2` from Firefox's cookie jar.
-   You can still pass `--cookie` explicitly to override this.
+    overleaf-sync <project_id|profile> [--url URL] [--output-dir DIR]
+    overleaf-sync --check <project_id|profile>     # read-only diagnostics
+    overleaf-sync <project_id> --dry-run           # pull only, log what would be sent
 
-2. Start a REPL session:
+Settings come from, in increasing priority: defaults, environment
+(OVERLEAF_URL, OVERLEAF_COOKIE_NAME, OVERLEAF_COOKIE), a TOML config file
+(./.overleaf-sync.toml or ~/.config/overleaf-sync/config.toml), then flags.
 
-   $ python3 overleaf_agent.py <project_id>
-
-   If the project has multiple documents you will be shown a numbered list
-   and asked to pick one:
-
-     [1] main.tex          (doc: 69a81e69bdcdae63f5c4be41, v526)
-     [2] references/refs.bib  ...
-   Select document [1-2]: 1
-
-   Then type instructions one after another:
-
-     Editing: main.tex (v526, 18069 chars)
-     >>> add an easter egg in the conclusion
-       Assistant: Added a hidden comment in the conclusion
-     Applying 1 OT operation...
-     Done. (v527)
-     >>> make the abstract shorter
-     ...
-     >>> exit
-
-3. To skip the file picker, pass --doc-id:
-   $ python3 overleaf_agent.py <project_id> \
-       --doc-id 69a81e69bdcdae63f5c4be41
-
-HOW IT WORKS
-------------
-  Session startup:
-    - Connects to Overleaf via Socket.io (WebSocket, kept alive in a thread)
-    - Joins the project and the selected document
-    - Receives the current document content + version number
-
-  On each instruction:
-    - Sends current content + instruction to the model
-    - The model returns the modified content via tool use
-    - Diffs old vs new → minimal insert/delete OT operations
-    - Pushes ops via the live WebSocket (applyOtUpdate)
-    - Changes appear in Overleaf instantly; version increments
-
-  Background WebSocket thread:
-    - Heartbeats keep the connection alive between instructions
-    - otUpdateApplied events from other collaborators are applied to the
-      local content copy so the model always sees the latest version
-
-USING FROM WITHIN AN AGENT SESSION
----------------------------------
-Add to your local agent instructions:
-
-  ## Tools
-  - python3 overleaf_agent.py <project_id> [--cookie $OVERLEAF_COOKIE] [--doc-id <id>]
-    Opens an interactive REPL to live-edit the Overleaf document.
-
-Default auth source:
-  Firefox cookies.sqlite → overleaf_session2
-
-Override sources:
-  --cookie
-  OVERLEAF_COOKIE
-
-For non-interactive use from an agent pass --doc-id so the file picker is
-skipped.
-
-Dependencies:
-  pip install requests websocket-client anthropic
-
-Environment (one of):
-  ANTHROPIC_API_KEY=sk-ant-...
-  ANTHROPIC_BASE_URL=... + ANTHROPIC_AUTH_TOKEN=...   (agent proxy)
-  --api-key flag
+Authentication (first match wins): --cookie, --cookie-file / cookie_file,
+$OVERLEAF_COOKIE, --login-email with a password from --password-file or
+$OVERLEAF_PASSWORD (self-hosted only), the Firefox cookie jar.
 """
 
 import argparse
@@ -203,6 +143,8 @@ def load_overleaf_cookie(
     explicit_cookie: str | None = None,
     firefox_profile: str | None = None,
     cookie_db: str | None = None,
+    url: str | None = None,
+    cookie_name: str | None = None,
 ) -> str:
     """
     Resolve overleaf_session2, preferring:
@@ -216,6 +158,13 @@ def load_overleaf_cookie(
     env_cookie = os.environ.get("OVERLEAF_COOKIE")
     if env_cookie:
         return env_cookie
+
+    from urllib.parse import urlparse
+    import overleaf_cli
+    url = url or overleaf_cli.BASE_URL
+    cookie_name = cookie_name or overleaf_cli.COOKIE_NAME
+    host = urlparse(url).hostname or "www.overleaf.com"
+    parent = host.split(".", 1)[1] if host.count(".") >= 2 else host
 
     candidates: list[Path] = []
     if cookie_db:
@@ -254,11 +203,12 @@ def load_overleaf_cookie(
                     """
                     SELECT value, lastAccessed
                     FROM moz_cookies
-                    WHERE name = 'overleaf_session2'
-                      AND (host = '.overleaf.com' OR host = 'www.overleaf.com')
+                    WHERE name = ?
+                      AND host IN (?, ?, ?)
                     ORDER BY lastAccessed DESC
                     LIMIT 1
-                    """
+                    """,
+                    (cookie_name, host, "." + host, "." + parent),
                 ).fetchone()
             if row and (best_row is None or row[1] > best_row[1]):
                 best_row = row
@@ -270,7 +220,7 @@ def load_overleaf_cookie(
         return best_row[0]
 
     print(
-        "Error: overleaf_session2 not found in Firefox cookie jars.\n"
+        f"Error: {cookie_name} for {host} not found in Firefox cookie jars.\n"
         f"Checked: {', '.join(str(p) for p in candidates)}\n"
         "Pass --cookie explicitly if your active browser session is elsewhere."
     )
@@ -1630,94 +1580,200 @@ class OverleafSync:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def load_config(path: str | None) -> tuple[dict, Path | None]:
+    """Read the TOML config (explicit path, ./.overleaf-sync.toml, or the user config)."""
+    import tomllib
+    candidates = [Path(path).expanduser()] if path else [
+        Path.cwd() / ".overleaf-sync.toml",
+        Path.home() / ".config" / "overleaf-sync" / "config.toml",
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                return tomllib.loads(p.read_text(encoding="utf-8")), p
+            except tomllib.TOMLDecodeError as e:
+                print(f"Error: {p}: {e}", file=sys.stderr)
+                sys.exit(1)
+    if path:
+        print(f"Error: config file {path} not found", file=sys.stderr)
+        sys.exit(1)
+    return {}, None
+
+
+def resolve_settings(args, cfg: dict) -> dict:
+    """Merge flags > project profile > top-level config; pick the project."""
+    projects = cfg.get("projects", {})
+    target = args.project_id
+    profile: dict = {}
+    name = None
+    if target in projects:
+        name, profile = target, projects[target]
+    elif target is None and projects:
+        if len(projects) == 1:
+            name, profile = next(iter(projects.items()))
+        else:
+            sys.exit("Error: several projects in the config; name one: " + ", ".join(sorted(projects)))
+    project_id = profile.get("project_id") or (target if target not in projects else None)
+    if project_id is None:
+        project_id = project_from_git_remote()
+    if not re.fullmatch(r"[0-9a-f]{24}", project_id or ""):
+        sys.exit(f"Error: {project_id!r} is not an Overleaf project id (24 hex characters, from the project URL)")
+    pick = lambda key: profile.get(key, cfg.get(key))
+    output_dir = args.output_dir or pick("output_dir") or os.path.join(os.getcwd(), name or project_id)
+    return {
+        "project_id": project_id,
+        "name": name,
+        "url": args.url or pick("url"),
+        "cookie_name": args.cookie_name or pick("cookie_name"),
+        "cookie_file": args.cookie_file or pick("cookie_file"),
+        "output_dir": str(Path(output_dir).expanduser()),
+        "dry_run": args.dry_run or bool(pick("dry_run")),
+    }
+
+
+def project_from_git_remote() -> str:
+    import subprocess as _sp
+    try:
+        remotes_out = _sp.check_output(["git", "remote", "-v"], stderr=_sp.PIPE, text=True)
+    except Exception as exc:
+        sys.exit(f"Error: no project given and 'git remote -v' failed: {exc}")
+    m = re.search(r"overleaf\.com/([a-f0-9]{24})", remotes_out)
+    if not m:
+        sys.exit("Error: no project given, no config, and no Overleaf git remote found.\n"
+                 "Pass the project id (the 24 hex characters in the project URL).")
+    print(f"[auto] project_id={m.group(1)} (from git remote)", flush=True)
+    return m.group(1)
+
+
+def run_check(settings: dict, cookie: str) -> int:
+    """Read-only diagnostics: authenticate, join the project and every doc, compare with the local folder."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import overleaf_cli
+    out_dir = Path(settings["output_dir"])
+    print(f"Instance : {overleaf_cli.BASE_URL}  (session cookie: {overleaf_cli.COOKIE_NAME})")
+    print(f"Project  : {settings['project_id']}")
+    print(f"Folder   : {out_dir}  ({'exists' if out_dir.is_dir() else 'will be created'})")
+    session = overleaf_cli.OverleafSession(cookie)
+    boot = session.get_project_bootstrap(settings["project_id"])
+    print(f"Logged in: yes — project \"{boot.get('ol-projectName', '?')}\"")
+    ws = TrackingSocketIOClient(session, settings["project_id"])
+    ws.connect()
+    ws.run_forever()
+    try:
+        raw = collect_docs_from_project(ws.join_project())
+        docs = filter_safe_docs(raw)
+        if not docs:
+            print("Error: the project has no text documents")
+            return 1
+        print(f"Real-time: connected, {len(docs)} text document(s)"
+              + (f" ({len(raw) - len(docs)} ignored: unsafe path)" if len(raw) != len(docs) else ""))
+        differing = 0
+        for doc_id, rel in sorted(docs.items(), key=lambda x: x[1]):
+            lines, version = ws.join_doc(doc_id)
+            content = "\n".join(lines)
+            local = out_dir / rel
+            if not local.exists():
+                state = "not on disk yet"
+            else:
+                try:
+                    same = local.read_text(encoding="utf-8") == content
+                except UnicodeDecodeError:
+                    same = False
+                state = "identical" if same else "DIFFERS (a backup is kept before it is replaced)"
+                differing += not same
+            print(f"  {rel:<45} v{version:<6} {len(content):>8} chars   {state}")
+            ws.leave_doc(doc_id)
+        print("\nOK: nothing was modified. Start with --dry-run first on an important project.")
+        return 0
+    finally:
+        ws.disconnect()
+
+
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Live Overleaf ↔ local sync and model editing REPL",
+        prog="overleaf-sync",
+        description="Live two-way sync between an Overleaf project and a local folder.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              # zero-arg sync from a git repo with an Overleaf remote
-              python3 overleaf_agent.py --sync
+              overleaf-sync 69a0589216d96e98bc76b8c6 --dry-run     # first look, sends nothing
+              overleaf-sync 69a0589216d96e98bc76b8c6 --check       # diagnostics only
+              overleaf-sync paper                                  # profile from the config file
+              overleaf-sync 69a0... --url http://localhost:8080 --login-email me@x.org --password-file pw
 
-              # interactive file picker → REPL
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..."
-
-              # skip file picker
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --doc-id 69a81e69bdcdae63f5c4be41
-
-              # passive mirror: Overleaf → local
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --listen
-
-              # bidirectional sync: Overleaf ↔ local
-              python3 overleaf_agent.py 69a0589216d96e98bc76b8c6 \\
-                  --cookie "s:abc123..." --sync
+            config (~/.config/overleaf-sync/config.toml):
+              url = "https://www.overleaf.com"
+              cookie_file = "~/.config/overleaf-sync/cookie"
+              [projects.paper]
+              project_id = "69a0589216d96e98bc76b8c6"
+              output_dir = "~/papers/paper"
         """),
     )
     parser.add_argument("project_id", nargs="?", default=None,
-                        help="Overleaf project ID (from the URL); auto-detected from git remote if omitted)")
+                        help="project id (24 hex chars from the URL) or a profile name from the config; "
+                             "taken from the config or a git remote if omitted")
+    parser.add_argument("--url", default=None, help="Overleaf instance (default https://www.overleaf.com)")
+    parser.add_argument("--cookie-name", default=None,
+                        help="session cookie name (default: overleaf_session2 on overleaf.com, overleaf.sid elsewhere)")
     parser.add_argument("--cookie", default=None,
-                        help="overleaf_session2 cookie value (overrides Firefox/default lookup)")
-    parser.add_argument("--cookie-file", default=None,
-                        help="File holding the cookie value (safer than --cookie: not visible in ps)")
-    parser.add_argument("--firefox-profile", default=None,
-                        help="Firefox profile directory to read cookies.sqlite from")
-    parser.add_argument("--cookie-db", default=None,
-                        help="Path to a specific Firefox cookies.sqlite database")
-    parser.add_argument("--listen", action="store_true",
-                        help="Passive mode: Overleaf → local folder, read-only")
+                        help="session cookie value (visible in ps; prefer --cookie-file)")
+    parser.add_argument("--cookie-file", default=None, help="file holding the session cookie value")
+    parser.add_argument("--login-email", default=None,
+                        help="log in with e-mail/password (self-hosted only; overleaf.com needs the browser cookie)")
+    parser.add_argument("--password-file", default=None, help="file holding the password for --login-email")
+    parser.add_argument("--firefox-profile", default=None, help="Firefox profile directory to read cookies.sqlite from")
+    parser.add_argument("--cookie-db", default=None, help="path to a specific Firefox cookies.sqlite")
+    parser.add_argument("--config", default=None, help="config file (default ./.overleaf-sync.toml, then ~/.config/overleaf-sync/config.toml)")
+    parser.add_argument("--output-dir", default=None, help="local folder (default ./<project id or profile>)")
+    parser.add_argument("--check", action="store_true", help="read-only diagnostics, then exit")
+    parser.add_argument("--listen", action="store_true", help="one-way mirror Overleaf → local")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Sync Overleaf → local but never send local edits; log what would be sent")
-    parser.add_argument("--output-dir", default=None,
-                        help="Local folder (default: current working directory)")
+                        help="pull from Overleaf but never send local edits; log what would be sent")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    cfg, cfg_path = load_config(args.config)
+    settings = resolve_settings(args, cfg)
 
-    if args.project_id is None:
-        import re as _re
-        import subprocess as _sp
+    sys.path.insert(0, str(Path(__file__).parent))
+    import overleaf_cli
+    overleaf_cli.configure(settings["url"], settings["cookie_name"])
+
+    cookie_file = settings["cookie_file"]
+    cookie = args.cookie
+    if not cookie and cookie_file:
+        cookie = read_cookie_file(cookie_file)
+    if not cookie and args.login_email and not os.environ.get("OVERLEAF_COOKIE"):
+        password = (Path(args.password_file).expanduser().read_text().strip() if args.password_file
+                    else os.environ.get("OVERLEAF_PASSWORD"))
+        if not password:
+            sys.exit("Error: --login-email needs --password-file or $OVERLEAF_PASSWORD")
         try:
-            remotes_out = _sp.check_output(
-                ["git", "remote", "-v"], stderr=_sp.PIPE, text=True
-            )
-        except Exception as exc:
-            parser.error(f"No project_id given and 'git remote -v' failed: {exc}")
-        m = _re.search(r"overleaf\.com/([a-f0-9]{24})", remotes_out)
-        if not m:
-            parser.error(
-                f"No project_id given and no Overleaf remote found.\n"
-                f"git remotes:\n{remotes_out.strip() or '  (none)'}\n"
-                f"Add one with: git remote add origin https://git.overleaf.com/<project_id>"
-            )
-        args.project_id = m.group(1)
-        remote_url = _re.search(r"\S+overleaf\S+", remotes_out).group(0)  # type: ignore[union-attr]
-        print(f"[auto] project_id={args.project_id} (from git remote {remote_url})", flush=True)
-
-    if args.output_dir is None:
-        args.output_dir = os.path.join(os.getcwd(), args.project_id)
-
-    if args.cookie_file and not args.cookie:
-        args.cookie = read_cookie_file(args.cookie_file)
+            cookie = overleaf_cli.login_with_password(args.login_email, password)
+        except overleaf_cli.AuthError as e:
+            sys.exit(f"Error: {e}")
     session_cookie = load_overleaf_cookie(
-        explicit_cookie=args.cookie,
+        explicit_cookie=cookie,
         firefox_profile=args.firefox_profile,
         cookie_db=args.cookie_db,
     )
 
+    if args.check:
+        try:
+            sys.exit(run_check(settings, session_cookie))
+        except overleaf_cli.AuthError as e:
+            sys.exit(f"Error: {e}")
     if args.listen:
         OverleafListener(
-            project_id=args.project_id,
+            project_id=settings["project_id"],
             session_cookie=session_cookie,
-            output_dir=args.output_dir,
+            output_dir=settings["output_dir"],
         ).run()
     else:
         OverleafSync(
-            project_id=args.project_id,
+            project_id=settings["project_id"],
             session_cookie=session_cookie,
-            output_dir=args.output_dir,
-            dry_run=args.dry_run,
+            output_dir=settings["output_dir"],
+            dry_run=settings["dry_run"],
         ).run()
 
 

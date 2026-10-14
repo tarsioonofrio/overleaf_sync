@@ -1,0 +1,100 @@
+Metadata-Version: 2.4
+Name: overleaf-sync
+Version: 0.2.0
+Summary: Live two-way sync between an Overleaf project and a local folder, for any editor or coding agent
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: requests
+Requires-Dist: websocket-client
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Provides-Extra: e2e
+Requires-Dist: selenium; extra == "e2e"
+
+# overleaf-sync
+
+Bidirectional live sync between Overleaf and an AI coding agent — without going through Git.
+
+## The problem
+
+Overleaf's Git integration is painful when two beings are editing simultaneously (human-human, human-agent): every push risks a conflict, and pushing while someone is typing in the browser fails outright. The Git bridge was not designed for high-frequency, automated writes.
+
+## The solution
+
+This project uses the Overleaf real-time collaboration protocol and speaks it directly. Changes flow both ways in real time — the same way a second browser tab would — so there are no commits, no pushes, and no conflicts.
+
+## Status
+
+Early MVP. The core sync loop is fully working:
+
+- reads the current document state from Overleaf
+- applies agent edits via `applyOtUpdate` (insert / delete ops)
+- polls for remote changes and merges them locally
+- triggers LaTeX compile on demand
+
+Not yet covered: folder operations.
+
+## Usage
+
+```bash
+pip install -r requirements.txt
+
+python3 overleaf_sync.py <project_id>
+```
+
+Get `overleaf_session2` from your browser cookies while logged in to overleaf.com. Get `project_id` from the URL (`/project/<id>`).
+
+## Live concurrent editing
+
+While a coauthor types, their ops are merged into the local file, never written over it (`test_concurrent_edits.py`):
+
+- 🧾 State per doc: `content` = server doc + our in-flight op; the file = `content` + edits not pushed yet.
+- 📥 A coauthor's op is transformed (ShareJS text OT, `transform_x`) past our in-flight op and past the unpushed local edits, then applied to the file.
+- 📤 A local change is sent as one `applyOtUpdate`; it is acknowledged by its stripped `{v, doc}` echo, not by the callback (which only means "queued"). One in flight per doc.
+- 🔁 If the push is rejected or never echoed: re-join the doc and 3-way merge the local file onto the server content.
+
+## Safeguards against destroying the server document
+
+- 🕐 A local change is pushed only after the file has had the same content on two consecutive polls, so a half-written (truncated) save is never sent.
+- 🛑 A change that empties the file or removes more than half of a 200+ char doc is held until the file is stable for 5 s.
+- ❌ `joinDoc` timeouts/errors raise instead of looking like an empty doc (which would be merged as "server deleted everything").
+- 🔀 A version gap in incoming updates, or an exception in the update handler, drops the socket; the reconnect path re-joins and 3-way merges instead of pushing from a stale copy.
+- 💾 At startup, a local file that differs from Overleaf is copied to `<dir>/.overleaf-sync-backup/<timestamp>/` before being overwritten.
+- 📝 Local writes are atomic (temp file + rename) and the merge re-reads the file right before replacing it, so an editor save in between is not lost.
+- 🌲 When a doc is added, renamed, moved or removed in Overleaf, the sync reconnects to rebuild the doc tree; docs removed upstream stop syncing (local copy untouched). Events used: `reciveNewDoc`, `reciveEntityRename`, `reciveEntityMove`, `removeEntity` (names as in Overleaf's realtime server; not yet verified against a live project).
+- ⚠️ Local files that are not Overleaf docs are never uploaded; a warning is printed.
+- 🧪 `--dry-run`: pulls from Overleaf but never sends; logs what would be pushed. Use it first on a real project.
+- 🚫 If the server rejects an update (`otUpdateError`, e.g. over the 2 MB doc limit) the local file is backed up and kept, merged from the pre-update doc on reconnect, and that content is not sent again unless the file changes. Content over 2 MiB is not sent at all.
+- 🔒 One sync per directory (lock file); a second instance exits.
+- 🔑 `--cookie-file` keeps the cookie out of `ps`/history; an expired or revoked session stops the sync with a clear error after 3 attempts (files untouched).
+- 🪢 A doc renamed or moved in Overleaf takes its local file (and pending edits) along.
+- 🧬 Concurrent edits: changes are diffed per hunk (patience diff) so a coauthor's text between two of your edits keeps its place; local files are swapped in with `renameat2(RENAME_EXCHANGE)` and the merge is redone if an editor saved meanwhile.
+- Overleaf itself rejects a delete whose text does not match the document, and keeps full history (restore from Overleaf's History if needed).
+
+## Reconnect invariants (data-loss prevention)
+
+These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
+
+### Scenario A — No edits during disconnection (idle outage)
+Both sides unchanged. **No-op.** Local file stays as-is.
+
+### Scenario B — Only server edits (stale local)
+Local file is **identical to the last-synced state** (the user did not edit locally during the outage).  
+✅ **Invariant:** the local file is **overwritten** with the latest server content. The poll loop does **NOT** push anything to Overleaf.  
+💣 This was the critical data-loss bug: the old code treated a stale file as a pending local edit and pushed old content back to the server, reverting all changes made during the outage.
+
+### Scenario C — Only local edits (genuine pending edits)
+Local file has **new content** relative to the pre-disconnect state; server is unchanged.  
+✅ **Invariant:** local edits are preserved as-is. The poll loop computes OT ops from server content → local content and pushes them to Overleaf.
+
+### Scenario D — Both sides edited different, non-overlapping regions
+Both local and server have new content in distinct parts of the document.  
+✅ **Invariant:** a 3-way merge is performed: local changes are computed as OT ops against the old state, then applied on top of the server state. Both sides' changes survive. The poll loop then pushes the merged result to Overleaf.
+
+### Scenario E — Both sides edited overlapping regions
+Both local and server modified the same span of text.  
+✅ **Invariant:** OT merge is applied deterministically. No crash, no corrupted output, no data loss. Insertions from both sides survive where OT semantics allow.
+
+### Poll-loop correctness (always)
+For every reconnect, the in-memory state is set to the server content. The poll loop then diffs (in-memory state → local file) and pushes the result.  
+✅ **Invariant:** `apply_sharejs_ops(new_memory, ops_to_push) == new_local` — the poll loop always faithfully reproduces the merged local content.

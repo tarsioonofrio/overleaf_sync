@@ -1,0 +1,10 @@
+README.md
+overleaf_cli.py
+overleaf_sync.py
+pyproject.toml
+overleaf_sync.egg-info/PKG-INFO
+overleaf_sync.egg-info/SOURCES.txt
+overleaf_sync.egg-info/dependency_links.txt
+overleaf_sync.egg-info/entry_points.txt
+overleaf_sync.egg-info/requires.txt
+overleaf_sync.egg-info/top_level.txt
