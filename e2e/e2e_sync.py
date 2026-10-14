@@ -72,18 +72,23 @@ for i in range(5):
 time.sleep(3); stop[0]=True; th.join()
 check("4 truncate/rewrite never emptied server", min(mins)>len(good)*0.5, f"min={min(mins)} final={len(good)}")
 check("4 server final == local", wait(lambda:R.content("main.tex")[0]==M.read_text()))
-# 5 deliberate wipe: held >=5s then pushed
-M.write_text(""); time.sleep(2.5)
-check("5 wipe held (server intact at 2.5s)", len(R.content("main.tex")[0])>100)
-check("5 wipe pushed after hold", wait(lambda:R.content("main.tex")[0]=="",15))
+# 5 an emptied file is never pushed on its own; the user confirms with a sentinel file
+M.write_text(""); time.sleep(12)
+check("5 wipe held (server intact after 12s, hold is 5s)", len(R.content("main.tex")[0])>100)
+check("5 the sync says how to confirm", "confirm with: touch" in logtxt())
+(OUT/".overleaf-sync-confirm-wipe").touch()
+check("5 wipe pushed after confirmation", wait(lambda:R.content("main.tex")[0]=="",20))
+check("5 sentinel consumed", not (OUT/".overleaf-sync-confirm-wipe").exists())
 M.write_text(good); wait(lambda:R.content("main.tex")[0]==good,15)
-# 6 offline edit while stopped -> backup on restart
+# 6 edits on both sides while stopped are merged on restart
 p.terminate(); p.wait(); time.sleep(1)
-M.write_text("OFFLINE EDIT\n"); sc=R.content("main.tex")[0]
-n0=len(logtxt()); p=start_sync(); wait(lambda:"Bidirectional sync active" in logtxt()[n0:],40); time.sleep(1)
+M.write_text(good+"%% OFFLINE LOCAL\n"); sc=R.content("main.tex")[0]; R.edit("main.tex","%% OFFLINE REMOTE\n"+sc)
+n0=len(logtxt()); p=start_sync(); wait(lambda:"Bidirectional sync active" in logtxt()[n0:],40)
+both=lambda t:"%% OFFLINE LOCAL" in t and "%% OFFLINE REMOTE" in t
+check("6 both offline edits reach the server", wait(lambda:both(R.content("main.tex")[0]),30))
+check("6 local == server, each edit once", wait(lambda:M.read_text()==R.content("main.tex")[0],20) and M.read_text().count("OFFLINE LOCAL")==1 and M.read_text().count("OFFLINE REMOTE")==1)
 bk=list(OUT.glob(".overleaf-sync-backup/*/main.tex"))
-check("6 offline edit backed up", bk and bk[-1].read_text()=="OFFLINE EDIT\n")
-check("6 local restored from server", M.read_text()==sc and R.content("main.tex")[0]==sc)
+check("6 pre-merge local file kept in backup", any("OFFLINE LOCAL" in b.read_text() for b in bk))
 # 7 new doc created in Overleaf
 s2=requests.Session(); s2.cookies.set("overleaf.sid",COOKIE,domain="127.0.0.1")
 t=s2.get(f"http://127.0.0.1:18080/project/{PID}").text
