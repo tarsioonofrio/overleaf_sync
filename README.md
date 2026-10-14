@@ -43,10 +43,12 @@ While a coauthor types, their ops are merged into the local file, never written 
 ## Safeguards against destroying the server document
 
 - 🕐 A local change is pushed only after the file has had the same content on two consecutive polls, so a half-written (truncated) save is never sent.
-- 🛑 A change that empties the file or removes more than half of a 200+ char doc is held until the file is stable for 5 s.
+- 🛑 A change that removes more than half of a 200+ char doc is held until the file is stable for 5 s.
+- 🗑️ A file that was **emptied** (or left with only whitespace) is never pushed on its own: the sync warns and keeps the doc intact in Overleaf. Restore the file to cancel, or confirm the wipe with `touch <dir>/.overleaf-sync-confirm-wipe` (used once, only after the warning; `--allow-wipe` / `allow_wipe = true` skips the question for scripted use).
 - ❌ `joinDoc` timeouts/errors raise instead of looking like an empty doc (which would be merged as "server deleted everything").
 - 🔀 A version gap in incoming updates, or an exception in the update handler, drops the socket; the reconnect path re-joins and 3-way merges instead of pushing from a stale copy.
-- 💾 At startup, a local file that differs from Overleaf is copied to `<dir>/.overleaf-sync-backup/<timestamp>/` before being overwritten.
+- 💾 The last version both sides agreed on is kept per doc in `<dir>/.overleaf-sync-base/`. At startup, edits made to a file while the sync was stopped are 3-way merged with whatever changed in Overleaf meanwhile and then pushed; the pre-merge file is also copied to `<dir>/.overleaf-sync-backup/<timestamp>/`. With no saved base (first run, or another project) a local file that differs from Overleaf is backed up there and Overleaf's version wins.
+- 😀 Overleaf stores every character outside the BMP (emoji, some math symbols) as two U+FFFD, even when typed in the browser. The sync mirrors that in the local file (and says so), so `😀` becomes `��` on disk.
 - 📝 Local writes are atomic (temp file + rename) and the merge re-reads the file right before replacing it, so an editor save in between is not lost.
 - 🌲 When a doc is added, renamed, moved or removed in Overleaf, the sync reconnects to rebuild the doc tree; docs removed upstream stop syncing (local copy untouched). Events used: `reciveNewDoc`, `reciveEntityRename`, `reciveEntityMove`, `removeEntity` (names as in Overleaf's realtime server; not yet verified against a live project).
 - ⚠️ Local files that are not Overleaf docs are never uploaded; a warning is printed.

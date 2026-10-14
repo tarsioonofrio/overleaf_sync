@@ -35,7 +35,7 @@ def test_changing_content_resets_stability(tmp_path):
     assert sync._settled([("d1", "hello", "hello ab")]) == []
 
 
-def test_empty_file_is_held_then_pushed(tmp_path, monkeypatch):
+def test_empty_file_is_held_until_confirmed_then_pushed(tmp_path, monkeypatch):
     sync = _sync(tmp_path)
     now = [100.0]
     monkeypatch.setattr(overleaf_sync._time, "monotonic", lambda: now[0])
@@ -43,6 +43,11 @@ def test_empty_file_is_held_then_pushed(tmp_path, monkeypatch):
     assert sync._settled(change) == []
     now[0] += 1.0
     assert sync._settled(change) == []          # truncated file: still held
+    now[0] += sync.BIG_DELETE_SECS
+    assert sync._settled(change) == []          # unconfirmed wipe: never pushed on its own
+    (tmp_path / sync.WIPE_SENTINEL).touch()     # the user confirms
+    assert sync._settled(change) == []          # the usual hold still runs once
+    now[0] += 1.0
     now[0] += sync.BIG_DELETE_SECS
     assert sync._settled(change) == change      # deliberate wipe: pushed
 

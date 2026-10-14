@@ -140,6 +140,8 @@ def verify(name, blen=None, bhash=None):
         chk("only tokens added (rest == original)", stripped == ORIG, f"{len(stripped)} vs {len(ORIG)}")
     n = {"typing": 16, "sameline": 2, "burst": 150, "undo": 1, "offline": None}.get(name)
     if name == "typing": chk("8 L + 8 B tokens", sum(t[2] == "L" for t in toks) == 8 and sum(t[2] == "B" for t in toks) == 8, str(len(toks)))
+    if name == "offline":
+        chk("5 local + 4 browser tokens", sum(t[2] == "L" for t in toks) == 5 and sum(t[2] == "B" for t in toks) == 4, str(sorted(toks)))
     if name == "burst": chk("150 local lines present", sum(t[2] == "L" for t in toks) == 150, str(sum(t[2] == "L" for t in toks)))
     if name == "delete":
         chk("author line deleted, rest intact", stripped == ORIG.replace("\\author{You}\n", "", 1), f"{len(stripped)}")

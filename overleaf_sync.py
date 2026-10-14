@@ -951,12 +951,16 @@ class OverleafSync:
     POLL_INTERVAL = 0.5  # seconds between local file checks
 
     def __init__(self, project_id: str, session_cookie: str, output_dir: str,
-                 dry_run: bool = False):
+                 dry_run: bool = False, allow_wipe: bool = False):
         self.project_id = project_id
         self.session_cookie = session_cookie
         self.output_dir = Path(output_dir)
         # dry_run: never send anything to Overleaf; only log what would be sent.
         self.dry_run = dry_run
+        # allow_wipe: push a file that was emptied locally without asking first.
+        self.allow_wipe = allow_wipe
+        self._wipe_ok: set[str] = set()          # docs whose wipe the user confirmed
+        self._base_saved: dict[str, str] = {}    # doc_id → last base written to disk
         self._warned: set[str] = set()
         self._last_untracked_scan = 0.0
 
@@ -1175,8 +1179,27 @@ class OverleafSync:
         now = _time.monotonic()
         ready = []
         current = set()
+        sentinel = self.output_dir / self.WIPE_SENTINEL
+        wipes = [d for d, old, new in changes if self._is_wipe(old, new)]
+        if wipes and not self.allow_wipe and sentinel.exists():
+            self._wipe_ok.update(wipes)          # the user confirmed what is held right now
+            try:
+                sentinel.unlink()
+            except OSError:
+                pass
         for doc_id, old, new in changes:
             current.add(doc_id)
+            if self._is_wipe(old, new) and not self.allow_wipe and doc_id not in self._wipe_ok:
+                path = self._docs[doc_id]["path"]
+                self._warn_once(
+                    f"wipe:{doc_id}",
+                    f"{path} was emptied locally; NOT sending it ({len(old)} chars would be deleted "
+                    f"in Overleaf). Restore the file to cancel, or confirm with: "
+                    f"touch {sentinel}")
+                continue
+            if not self._is_wipe(old, new):
+                self._wipe_ok.discard(doc_id)
+                self._warned.discard(f"wipe:{doc_id}")
             seen = self._candidates.get(doc_id)       # (content, stable since, dirty since)
             if seen is None:
                 self._candidates[doc_id] = (new, now, now)
@@ -1198,7 +1221,41 @@ class OverleafSync:
         for doc_id in list(self._candidates):
             if doc_id not in current:
                 del self._candidates[doc_id]
+        self._wipe_ok &= current
         return ready
+
+    # The last version both sides agreed on, kept on disk per doc, so edits made
+    # while the sync was stopped are merged on the next start instead of being
+    # set aside (see _sync_all_docs).
+    BASE_DIR = ".overleaf-sync-base"
+    WIPE_SENTINEL = ".overleaf-sync-confirm-wipe"
+
+    def _base_path(self, doc_id: str) -> Path:
+        return self.output_dir / self.BASE_DIR / doc_id
+
+    def _load_base(self, doc_id: str) -> str | None:
+        try:
+            if (self.output_dir / self.BASE_DIR / ".project").read_text().strip() != self.project_id:
+                return None
+            return self._base_path(doc_id).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _save_base(self, doc_id: str, content: str) -> None:
+        if self._base_saved.get(doc_id) == content:
+            return
+        try:
+            d = self.output_dir / self.BASE_DIR
+            d.mkdir(exist_ok=True)
+            (d / ".project").write_text(self.project_id)
+            atomic_write(self._base_path(doc_id), content)
+            self._base_saved[doc_id] = content
+        except OSError as e:
+            self._warn_once("base-write", f"could not save the merge base: {e}")
+
+    @staticmethod
+    def _is_wipe(old: str, new: str) -> bool:
+        return bool(old.strip()) and not new.strip()
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key not in self._warned:
@@ -1253,6 +1310,7 @@ class OverleafSync:
                     self._warn_once(f"unsafe:{state['path']}", f"not syncing {state['path']}: {e}")
                     continue
                 if fc == state["content"]:
+                    self._save_base(doc_id, fc)
                     continue
                 if fc == self._rejected_content.get(doc_id):
                     self._warn_once(
@@ -1497,6 +1555,8 @@ class OverleafSync:
                 # server_content — we need it to detect stale local files.
                 old_state = self._docs.get(doc_id, {})
                 old_content = old_state.get("content", None)
+                if initial and old_content is None:
+                    old_content = self._load_base(doc_id)   # last agreed version of a past run
                 # An unacked op may not have reached the server: merge from
                 # before it so it is re-pushed rather than silently dropped.
                 inflight = old_state.get("inflight")
@@ -1527,7 +1587,7 @@ class OverleafSync:
                     os.replace(old_file, out_path)
                     print(f"  {_ts()} [sync] {old_path} was renamed in Overleaf → {pathname}", flush=True)
 
-            if not initial and out_path.exists():
+            if out_path.exists() and old_content is not None:
                 branch: list[str] = []
 
                 def reconcile(local_content: str) -> str:
@@ -1549,7 +1609,11 @@ class OverleafSync:
                     return merge3(merge_base or "", local_content, server_content)
 
                 _, seen = update_file(out_path, reconcile)
+                if initial and seen is not None and seen != server_content and branch == ["merge"]:
+                    self._backup_local(pathname, seen)      # keep the pre-merge file too
                 if seen != server_content:
+                    if initial:
+                        print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
                     if branch == ["stale"]:
                         print(f"  {_ts()} [sync] stale local {pathname} → updated to v{version}", flush=True)
                     else:
@@ -1563,6 +1627,7 @@ class OverleafSync:
                 if previous is not None and previous != server_content:
                     self._backup_local(pathname, previous)
             atomic_write(out_path, server_content)
+            self._save_base(doc_id, server_content)
             if initial:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
 
@@ -1581,6 +1646,10 @@ class OverleafSync:
 
     def run(self):
         self._acquire_dir_lock()
+        try:
+            (self.output_dir / self.WIPE_SENTINEL).unlink()    # only a confirmation given after a warning counts
+        except OSError:
+            pass
         self._running = True
         try:
             self._connect_and_sync_state(initial=True)
@@ -1689,6 +1758,7 @@ def resolve_settings(args, cfg: dict) -> dict:
         "cookie_file": args.cookie_file or pick("cookie_file"),
         "output_dir": str(Path(output_dir).expanduser()),
         "dry_run": args.dry_run or bool(pick("dry_run")),
+        "allow_wipe": args.allow_wipe or bool(pick("allow_wipe")),
     }
 
 
@@ -1788,6 +1858,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--output-dir", default=None, help="local folder (default ./<project id or profile>)")
     parser.add_argument("--check", action="store_true", help="read-only diagnostics, then exit")
     parser.add_argument("--listen", action="store_true", help="one-way mirror Overleaf → local")
+    parser.add_argument("--allow-wipe", action="store_true",
+                        help="push a file emptied locally without asking (default: hold it until confirmed)")
     parser.add_argument("--dry-run", action="store_true",
                         help="pull from Overleaf but never send local edits; log what would be sent")
 
@@ -1835,6 +1907,7 @@ def main(argv: list[str] | None = None):
             session_cookie=session_cookie,
             output_dir=settings["output_dir"],
             dry_run=settings["dry_run"],
+            allow_wipe=settings["allow_wipe"],
         ).run()
 
 
