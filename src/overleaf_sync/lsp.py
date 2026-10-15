@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from . import compile as _compile
 from . import sync as _sync
 from .ot import merge3
 
@@ -295,6 +296,13 @@ class Server:
         self.options: dict = {}
         self._shutdown = False
         self._thread: threading.Thread | None = None
+        self.cfg: dict = {}
+        self.compiler: _compile.Compiler | None = None
+        self.compile_on_save = False
+        self._compile_lock = threading.Lock()
+        self._compile_running = False
+        self._compile_pending = False
+        self._diag_uris: set[str] = set()
 
     # transport
     def _write(self, msg: dict) -> None:
@@ -368,7 +376,8 @@ class Server:
             self._write({"jsonrpc": "2.0", "id": rid, "result": {
                 "capabilities": {
                     "textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": False}},
-                    "executeCommandProvider": {"commands": ["overleaf.status", "overleaf.reloadDocument", "overleaf.confirm"]},
+                    "executeCommandProvider": {"commands": ["overleaf.status", "overleaf.reloadDocument", "overleaf.confirm", "overleaf.compile"]},
+                    "codeActionProvider": True,
                 },
                 "serverInfo": {"name": "overleaf-sync-lsp"}}})
         elif method == "initialized":
@@ -387,6 +396,11 @@ class Server:
                 self.sync.did_change(params["textDocument"]["uri"], changes[-1]["text"], params["textDocument"]["version"])
         elif method == "textDocument/didClose" and self.sync:
             self.sync.did_close(params["textDocument"]["uri"])
+        elif method == "textDocument/didSave":
+            if self.compile_on_save and self.compiler is not None:
+                self.request_compile(delay=1.5)          # let the last keystrokes reach Overleaf first
+        elif method == "textDocument/codeAction":
+            self._write({"jsonrpc": "2.0", "id": rid, "result": self.code_actions()})
         elif method == "workspace/executeCommand":
             result = self.execute(params.get("command"), params.get("arguments") or [])
             self._write({"jsonrpc": "2.0", "id": rid, "result": result})
@@ -394,7 +408,76 @@ class Server:
             self._write({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}})
         return None
 
+    def code_actions(self) -> list:
+        if self.compiler is None:
+            return []
+        return [{"title": "Overleaf: compile the project", "kind": "source",
+                 "command": {"title": "Overleaf: compile the project", "command": "overleaf.compile"}}]
+
+    # compiling on Overleaf: the result comes back as diagnostics and one message
+    def request_compile(self, delay: float = 0.0) -> str:
+        with self._compile_lock:
+            if self._compile_running:
+                self._compile_pending = True
+                return "queued"
+            self._compile_running = True
+        threading.Thread(target=self._compile_worker, args=(delay,), name="overleaf-compile", daemon=True).start()
+        return "started"
+
+    def _compile_worker(self, delay: float) -> None:
+        try:
+            while True:
+                if delay:
+                    time.sleep(delay)
+                    delay = 0.0
+                self._compile_once()
+                with self._compile_lock:
+                    if not self._compile_pending:
+                        self._compile_running = False
+                        return
+                    self._compile_pending = False
+        except BaseException as e:                           # never leave the flag set: the next request must work
+            with self._compile_lock:
+                self._compile_running = False
+            self.notify("error", f"compile stopped: {e}")
+
+    def _compile_once(self) -> None:
+        try:
+            result = self.compiler.compile()
+        except _compile.CompileError as e:
+            self.notify("error", f"compile failed: {e}")
+            return
+        self.publish_diagnostics(result.diagnostics)
+        if result.status == "success" and not result.errors:
+            head = "compiled"
+        else:
+            head = "compiled with errors" if result.errors else f"compile ended with status {result.status}"
+        extra = f" (PDF: {result.pdf_path})" if result.pdf_path else ""
+        self.notify("error" if result.errors else "info",
+                    f"{head}: {result.errors} error(s), {result.warnings} warning(s){extra}")
+
+    def publish_diagnostics(self, diags: list) -> None:
+        root = self.sync.output_dir if self.sync is not None else (self.root or Path.cwd())
+        by_uri: dict[str, list] = {}
+        for d in diags:
+            if not d.file:
+                continue
+            path = (root / d.file)
+            line = max(d.line - 1, 0)
+            by_uri.setdefault(path.resolve().as_uri(), []).append({
+                "range": {"start": {"line": line, "character": d.column}, "end": {"line": line, "character": max(d.column, 1000)}},
+                "severity": d.severity, "source": "overleaf", "message": d.message})
+        for uri in self._diag_uris - set(by_uri):            # files that are clean now
+            self._write({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": []}})
+        for uri, items in by_uri.items():
+            self._write({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": items}})
+        self._diag_uris = set(by_uri)
+
     def execute(self, command: str | None, args: list):
+        if command == "overleaf.compile":
+            if self.compiler is None:
+                return {"error": "no project is set up in this folder"}
+            return {"compile": self.request_compile()}
         if self.sync is None:
             return None
         if command == "overleaf.status":
@@ -417,6 +500,9 @@ class Server:
         except Exception as e:
             self.notify("error", f"could not start: {e}")
             return
+        opts = {**self.cfg, **self.options}
+        self.compile_on_save = bool(opts.get("compile_on_save", False))
+        self.compiler = _compile.Compiler(settings["project_id"], cookie, settings["output_dir"], bool(opts.get("compile_pdf", True)))
         self.sync = LspSync(settings["project_id"], cookie, settings["output_dir"],
                             dry_run=settings["dry_run"], allow_wipe=settings["allow_wipe"],
                             propagate_tree=settings["tree_sync"], prune_backups_days=settings["prune_backups_days"],
@@ -439,6 +525,7 @@ class Server:
         root = self.root or Path.cwd()
         found = next((d / ".overleaf-sync.toml" for d in (root, *root.parents) if (d / ".overleaf-sync.toml").is_file()), None)
         cfg, cfg_path = _sync.load_config(str(found) if found else None) if found else ({}, None)
+        self.cfg = dict(cfg)
         cfg = {**cfg, **{k: v for k, v in self.options.items() if k in ("project_id", "url", "cookie_name", "cookie_file", "output_dir")}}
         args = argparse.Namespace(project_id=None, output_dir=None, url=None, cookie_name=None, cookie_file=None, dry_run=False, allow_wipe=False,
                                   allow_unknown_protocol=False, no_tree_sync=False, prune_backups=None)

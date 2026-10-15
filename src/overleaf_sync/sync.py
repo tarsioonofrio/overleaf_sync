@@ -1959,7 +1959,7 @@ def run_check(settings: dict, cookie: str) -> int:
 # ---------------------------------------------------------------------------
 
 DEFAULT_HOSTS = ("www.overleaf.com", "overleaf.com")
-GITIGNORE_LINES = (".overleaf-sync-backup/", ".overleaf-sync-base/", ".overleaf-sync.lock", ".overleaf-sync-confirm-wipe")
+GITIGNORE_LINES = (".overleaf-sync-backup/", ".overleaf-sync-base/", ".overleaf-sync-build/", ".overleaf-sync.lock", ".overleaf-sync-confirm-wipe")
 
 
 def parse_project_ref(ref: str) -> tuple[str, str | None]:

@@ -8,6 +8,7 @@ Bidirectional live sync between Overleaf and an AI coding agent — without goin
 |---|---|
 | `src/overleaf_sync/sync.py` | the file-sync daemon, `init`, and the `overleaf-sync` command |
 | `src/overleaf_sync/lsp.py` | the language server (`overleaf-sync-lsp`): open editor buffers sync live, no saving needed |
+| `src/overleaf_sync/compile.py` | compile on Overleaf and turn the LaTeX log into diagnostics (used by the language server) |
 | `src/overleaf_sync/ot.py` | pure text / operational-transformation helpers (diff, apply, transform, 3-way merge) |
 | `src/overleaf_sync/client.py` | Overleaf web and real-time client (also a small debugging CLI: `python -m overleaf_sync.client`) |
 | `tests/` | unit tests: `pip install -e ".[test]" && pytest` |
@@ -70,7 +71,9 @@ overleaf-sync --check <project_id>   # also shows when the Firefox-saved session
 vim.lsp.start({ name = "overleaf", cmd = { "overleaf-sync-lsp" }, root_dir = vim.fs.root(0, ".overleaf-sync.toml") })
 ```
 
-Commands (`workspace/executeCommand`): `overleaf.status`, `overleaf.confirm` (the `touch` confirmation for an emptied file or a deletion), `overleaf.reloadDocument` (see below).
+Commands (`workspace/executeCommand`): `overleaf.compile` (see below), `overleaf.status`, `overleaf.confirm` (the `touch` confirmation for an emptied file or a deletion), `overleaf.reloadDocument` (see below).
+
+**Compile and diagnostics.** `overleaf.compile` (also offered as the code action *Overleaf: compile the project*) asks Overleaf to compile the project and publishes the LaTeX log as diagnostics: errors and warnings on the right file and line, overfull/underfull boxes as hints. It answers at once and reports in a message when done; a compile requested while another runs is queued once. Compiling never changes the project. The log and the PDF are saved under `.overleaf-sync-build/` in the folder (not synced; added to `.gitignore` by `init`). Set `compile_on_save = true` in `.overleaf-sync.toml` (or in `initializationOptions`) to compile whenever a file is saved, and `compile_pdf = false` to skip downloading the PDF. Compiling uses your Overleaf compile quota, as the web editor does.
 
 What to know:
 - **Remote text never gets pushed back.** While an edit is on its way to the editor the engine uses the text it promised the editor, merges what you typed meanwhile (3-way), and only goes on after the editor reports the new version. If the editor keeps refusing the edit (stale version) or never reports it, the document is marked *diverged*: nothing more is sent for it, you get a message, and `overleaf.reloadDocument` puts Overleaf's text in the buffer (yours is saved under `.overleaf-sync-backup/` first).
