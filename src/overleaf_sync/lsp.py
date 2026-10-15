@@ -448,6 +448,7 @@ class Server:
         self.compiler: _compile.Compiler | None = None
         self.compile_on_save = False
         self.show_cursors = True
+        self.trace_path: Path | None = None     # set by `trace_requests = true`: what the editor asks, for debugging
         self.hint_refresh = False
         self._last_refresh = 0.0
         self._compile_lock = threading.Lock()
@@ -522,6 +523,8 @@ class Server:
             return None
         params = msg.get("params") or {}
         rid = msg.get("id")
+        if self.trace_path is not None:
+            self._trace(method, params)
         if method == "initialize":
             folders = params.get("workspaceFolders") or []
             root_uri = (folders[0]["uri"] if folders else None) or params.get("rootUri")
@@ -576,6 +579,20 @@ class Server:
         elif rid is not None:
             self._write({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}})
         return None
+
+    def _trace(self, method: str, params: dict) -> None:
+        """One line per request or notification (positions and ranges only, never document text)."""
+        keep = {k: params[k] for k in ("position", "range") if k in params}
+        td = (params.get("textDocument") or {}).get("uri")
+        if td:
+            keep["file"] = Path(uri_to_path(td) or td).name
+        if "contentChanges" in params:
+            keep["changes"] = len(params["contentChanges"])
+        try:
+            with open(self.trace_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": round(time.time(), 2), "method": method, **keep}) + "\n")
+        except OSError:
+            pass
 
     def refresh_hints(self) -> None:
         """Others' cursors moved: ask the editor to fetch the inlay hints again (at most a few times a second)."""
@@ -680,6 +697,10 @@ class Server:
         opts = {**self.cfg, **self.options}
         self.compile_on_save = bool(opts.get("compile_on_save", False))
         self.show_cursors = bool(opts.get("show_cursors", True))
+        if opts.get("trace_requests"):
+            build = Path(settings["output_dir"]) / _compile.Compiler.BUILD_DIR
+            build.mkdir(parents=True, exist_ok=True)
+            self.trace_path = build / "lsp-trace.log"
         self.compiler = _compile.Compiler(settings["project_id"], cookie, settings["output_dir"], bool(opts.get("compile_pdf", True)))
         self.sync = LspSync(settings["project_id"], cookie, settings["output_dir"],
                             dry_run=settings["dry_run"], allow_wipe=settings["allow_wipe"],
