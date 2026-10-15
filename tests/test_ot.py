@@ -189,3 +189,45 @@ def test_git_backup_roundtrip():
     lines = content.split("\n")
     if len(lines) > 1:
         roundtrip(content, "\n".join(lines[1:]))
+
+
+# ── fine-grained diffs keep concurrent edits in place ─────────────────────────────────────────────
+
+def test_a_token_typed_at_the_start_of_every_line_is_not_one_big_replace():
+    from overleaf_sync.ot import compute_ot_ops, apply_sharejs_ops
+    old = "<T12>line one\n<T3>line two\n<T16>line three\n"
+    new = "<T19><T12>line one\n<T34><T3>line two\n<T37><T16>line three\n"
+    ops = compute_ot_ops(old, new)
+    assert apply_sharejs_ops(old, ops) == new
+    assert sorted(o["p"] for o in ops) == [0, 14, 26 + 5] or all("d" not in o for o in ops)
+    assert all("d" not in o for o in ops) and len(ops) == 3
+
+
+def test_a_concurrent_edit_inside_a_rewritten_region_keeps_its_place():
+    from overleaf_sync.ot import merge3
+    base = "<T12><T11>line one\n<T3>line two\n<T16>line three\n"
+    mine = "<T19><T12><T11>line one\n<T34><T3>line two\n<T37><T16>line three\n"
+    theirs = "<T12><T11>line one\n<R30><T3>line two\n<T16>line three\n"
+    merged = merge3(base, mine, theirs)
+    assert merged == "<T19><T12><T11>line one\n<R30><T34><T3>line two\n<T37><T16>line three\n" or \
+        merged == "<T19><T12><T11>line one\n<T34><R30><T3>line two\n<T37><T16>line three\n"
+    for tok in ("<T19>", "<T34>", "<T37>", "<R30>"):
+        assert merged.count(tok) == 1
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_refined_diffs_always_reproduce_the_new_text(seed):
+    import random
+    from overleaf_sync.ot import compute_ot_ops, apply_sharejs_ops
+    r = random.Random(seed)
+    alphabet = ["a", "b", "<T1>", "\n", " ", "xy", "é", "\U0001F600"]
+    old = "".join(r.choice(alphabet) for _ in range(r.randint(0, 80)))
+    new = list(old)
+    for _ in range(r.randint(1, 8)):
+        i = r.randint(0, len(new))
+        if r.random() < 0.5:
+            new[i:i] = [r.choice(alphabet) for _ in range(r.randint(1, 4))]
+        else:
+            del new[i:i + r.randint(1, 4)]
+    new = "".join(new)
+    assert apply_sharejs_ops(old, compute_ot_ops(old, new)) == new

@@ -8,6 +8,7 @@ Shared by the file-sync daemon (`overleaf_sync.sync`) and any other front-end.
 
 from __future__ import annotations
 
+import difflib
 import re
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,177 @@ def _line_hunks(A: list[str], B: list[str], depth: int = 0) -> list[tuple[int, i
     return hunks
 
 
+REFINE_MAX_CELLS = 40_000     # lines(old) x lines(new) above this: leave the hunk as one replace
+REFINE_THOROUGH_CELLS = 1_000  # up to this many line pairs, similarity also counts text inserted mid-line
+REFINE_THOROUGH_SIMILARITY = 0.8   # ...but then it must be close: lines made of the same few characters match by accident
+REFINE_MIN_SIMILARITY = 0.5   # two lines are "the same line, edited" above this
+
+
+def _line_similarity(x: str, y: str, thorough: bool) -> float:
+    shorter = max(min(len(x), len(y)), 1)
+    size = min(1.0, 2 * shorter / max(len(x), len(y), 1))       # a very short text is not "the same line" as a long one
+    p = _common_prefix(x, y)
+    q = _common_suffix(x[p:], y[p:], min(len(x), len(y)) - p)
+    fast = size * (p + q) / shorter                          # a line with text added to it still counts as the same line
+    if fast >= REFINE_MIN_SIMILARITY or not thorough or max(len(x), len(y)) > 300:
+        return fast
+    sm = difflib.SequenceMatcher(None, x, y, autojunk=False)       # text added in the middle too
+    mid = size * sum(b.size for b in sm.get_matching_blocks()) / shorter
+    return mid if mid >= REFINE_THOROUGH_SIMILARITY else fast
+
+
+def _embed(short: str, long: str) -> list[int] | None:
+    """Indexes in `long` where `short` appears as a subsequence (leftmost embedding), or None."""
+    idx, j = [], 0
+    for ch in short:
+        j = long.find(ch, j)
+        if j < 0:
+            return None
+        idx.append(j)
+        j += 1
+    return idx
+
+
+def _pure_changes(o: str, n: str) -> list[tuple[int, str, str]] | None:
+    """If `n` is `o` with text only inserted (or only removed), those separate changes; else None."""
+    if not o or not n or len(o) == len(n):
+        return None
+    grows = len(n) > len(o)
+    short, long = (o, n) if grows else (n, o)
+    idx = _embed(short, long)
+    if idx is None:
+        return None
+    out, prev = [], 0                       # `prev`: index in `long` after the last matched char
+    for k, j in enumerate(idx + [len(long)]):
+        if j > prev:
+            gap = long[prev:j]
+            out.append((k, "", gap) if grows else (prev, gap, ""))
+        prev = j + 1
+    if grows:                               # `k` counted matched chars of o: that is the offset in o
+        return out
+    return out
+
+
+def _refine_hunk(o: str, n: str) -> list[tuple[int, str, str]]:
+    """
+    Split a replaced hunk into separate changes (offset in `o`, old text, new text).  A hunk can be a
+    whole stretch of lines when every line changed a little (a token typed at the start of each line):
+    as one delete+insert, a concurrent edit inside it would be dragged out of place when transformed.
+    Lines are paired by similarity (an order-preserving alignment); a paired line becomes one small
+    replace, unpaired lines whole deletions / insertions.
+    """
+    if o and n and o != n:
+        if len(n) > len(o) and o in n:                                  # text added on both sides of o
+            k = n.index(o)
+            return [c for c in ((0, "", n[:k]), (len(o), "", n[k + len(o):])) if c[2]]
+        if len(o) > len(n) and n in o:                                  # text removed on both sides of n
+            k = o.index(n)
+            return [c for c in ((0, o[:k], ""), (k + len(n), o[k + len(n):], "")) if c[1]]
+    A, B = o.splitlines(keepends=True), n.splitlines(keepends=True)
+    if not o or not n or len(A) * len(B) > REFINE_MAX_CELLS:
+        return [(0, o, n)]
+    thorough = len(A) * len(B) <= REFINE_THOROUGH_CELLS
+    sim = [[_line_similarity(x, y, thorough) for y in B] for x in A]
+    # best[i][j]: best total similarity pairing A[i:] with B[j:]
+    best = [[0.0] * (len(B) + 1) for _ in range(len(A) + 1)]
+    for i in range(len(A) - 1, -1, -1):
+        for j in range(len(B) - 1, -1, -1):
+            top = max(best[i + 1][j], best[i][j + 1])
+            if sim[i][j] >= REFINE_MIN_SIMILARITY:
+                top = max(top, best[i + 1][j + 1] + sim[i][j])
+            best[i][j] = top
+    pairs, i, j = [], 0, 0
+    while i < len(A) and j < len(B):
+        if sim[i][j] >= REFINE_MIN_SIMILARITY and best[i][j] == best[i + 1][j + 1] + sim[i][j]:
+            pairs.append((i, j)); i += 1; j += 1
+        elif best[i][j] == best[i + 1][j]:
+            i += 1
+        else:
+            j += 1
+    offs = [0]
+    for line in A:
+        offs.append(offs[-1] + len(line))
+    out: list[tuple[int, str, str]] = []
+    ai = bi = 0
+    for pi, pj in pairs + [(len(A), len(B))]:
+        if pi > ai or pj > bi:                                    # unpaired lines between two pairs
+            out.append((offs[ai], "".join(A[ai:pi]), "".join(B[bi:pj])))
+        if pi < len(A):
+            x, y = A[pi], B[pj]
+            p = _common_prefix(x, y)
+            q = _common_suffix(x[p:], y[p:], min(len(x), len(y)) - p)
+            xm, ym = x[p:len(x) - q], y[p:len(y) - q]
+            if xm and ym and len(ym) > len(xm) and xm in ym:           # text added on both sides of xm
+                k = ym.index(xm)
+                out.append((offs[pi] + p, "", ym[:k]))
+                out.append((offs[pi] + p + len(xm), "", ym[k + len(xm):]))
+            elif xm and ym and len(xm) > len(ym) and ym in xm:         # text removed on both sides of ym
+                k = xm.index(ym)
+                out.append((offs[pi] + p, xm[:k], ""))
+                out.append((offs[pi] + p + k + len(ym), xm[k + len(ym):], ""))
+            elif xm or ym:
+                pure = _pure_changes(xm, ym)
+                if pure:
+                    out.extend((offs[pi] + p + off, ot, nt) for off, ot, nt in pure)
+                else:
+                    out.append((offs[pi] + p, xm, ym))
+        ai, bi = pi + 1, pj + 1
+    return out or [(0, o, n)]
+
+
+def _unmatched(t: str) -> int:
+    """Delimiters of `t` left without a partner inside it ("<T5>" has none, "5><T" has two)."""
+    bad = t.count("$") % 2
+    for a, b in ("<>", "{}", "()", "[]"):
+        depth = 0
+        for ch in t:
+            if ch == a:
+                depth += 1
+            elif ch == b:
+                if depth:
+                    depth -= 1
+                else:
+                    bad += 1
+        bad += depth
+    return bad
+
+
+def _slide(old: str, start: int, text: str, deleting: bool, lo: int, hi: int, line_start_wins: bool) -> tuple[int, str]:
+    """
+    A pure insertion (or deletion) of `text` at `start` can often be written at several neighbouring
+    positions (inserting "<T3>" before "<T3>" is also inserting "4><T" after "<T3").  The diff picks
+    one by accident; a concurrent edit at the same spot would then land inside a word.  Move it only
+    to a place that cuts strictly fewer words (or, if line_start_wins, to the start of a line),
+    never outside [lo, hi], the untouched stretch of `old` around it.
+    """
+    def can_left(q: int, t: str) -> bool:
+        return q > lo and old[q - 1] == t[-1]
+
+    def can_right(q: int, t: str) -> bool:
+        i = q + len(t) if deleting else q                # the character the text would slide over
+        return i < hi and old[i] == t[0]
+
+    def cuts(q: int, t: str) -> tuple[int, int]:
+        """(unbalanced delimiters, words cut): the text a person typed is usually a whole unit."""
+        after = old[q + len(t)] if deleting and q + len(t) < len(old) else old[q] if not deleting and q < len(old) else ""
+        return _unmatched(t), int(q > 0 and old[q - 1].isalnum() and t[0].isalnum()) + int(t[-1].isalnum() and after.isalnum())
+
+    q, t = start, text
+    while can_left(q, t):
+        q, t = q - 1, t[-1] + t[:-1]
+    cands = []
+    while True:
+        if line_start_wins and (q == 0 or old[q - 1] == "\n"):
+            return q, t
+        cands.append((*cuts(q, t), abs(q - start), q, t))
+        if not can_right(q, t):
+            break
+        q, t = q + 1, t[1:] + t[0]
+    here = cuts(start, text)
+    best = min(cands)
+    return (best[3], best[4]) if best[:2] < here else (start, text)
+
+
 def compute_ot_ops(old: str, new: str) -> list[dict]:
     """
     Diff old → new and return a list of ShareJS ops in reverse position order
@@ -115,6 +287,7 @@ def compute_ot_ops(old: str, new: str) -> list[dict]:
 
     # Hunks as (old_start, old_text, new_text), ascending, in old coordinates.
     spans: list[tuple[int, str, str]] = []
+    refined: set[int] = set()            # indexes of spans produced by _refine_hunk
     if "\n" in old_mid or "\n" in new_mid:
         A = old_mid.splitlines(keepends=True)
         B = new_mid.splitlines(keepends=True)
@@ -130,9 +303,26 @@ def compute_ot_ops(old: str, new: str) -> list[dict]:
             q = _common_suffix(o[p:], n[p:], min(len(o), len(n)) - p)
             o_t, n_t = o[p:len(o) - q], n[p:len(n) - q]
             if o_t or n_t:
-                spans.append((prefix + offs[a1] + p, o_t, n_t))
+                parts = _refine_hunk(o_t, n_t)
+                for off, ot, nt in parts:
+                    if len(parts) > 1:
+                        refined.add(len(spans))
+                    spans.append((prefix + offs[a1] + p + off, ot, nt))
     else:
-        spans.append((prefix, old_mid, new_mid))
+        parts = _refine_hunk(old_mid, new_mid)
+        for off, ot, nt in parts:
+            if len(parts) > 1:
+                refined.add(len(spans))
+            spans.append((prefix + off, ot, nt))
+
+    # A pure insertion or deletion may be writable at several neighbouring places: pick the sensible one,
+    # without crossing the neighbouring changes.
+    for k, (start, o_t, n_t) in enumerate(spans):
+        if bool(o_t) != bool(n_t):
+            lo = spans[k - 1][0] + len(spans[k - 1][1]) if k else 0
+            hi = spans[k + 1][0] if k + 1 < len(spans) else len(old)
+            at, moved = _slide(old, start, o_t or n_t, deleting=bool(o_t), lo=lo, hi=hi, line_start_wins=k in refined)
+            spans[k] = (at, moved, "") if o_t else (at, "", moved)
 
     # Within one hunk the delete must run before the insert: if the insert ran
     # first, the cursor would land on the new text and the delete would remove

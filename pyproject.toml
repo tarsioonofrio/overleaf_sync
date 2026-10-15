@@ -12,6 +12,7 @@ dependencies = ["requests", "websocket-client"]
 
 [project.scripts]
 overleaf-sync = "overleaf_sync.sync:main"
+overleaf-sync-lsp = "overleaf_sync.lsp:main"
 
 [project.optional-dependencies]
 test = ["pytest"]

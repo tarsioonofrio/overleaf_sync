@@ -795,7 +795,7 @@ class OverleafSync:
                     _, remote_t = transform_x(local_ops, remote)
                     return apply_sharejs_ops(local, remote_t)
 
-                _, seen = update_file(out_path, merge_remote, default=old_content)
+                _, seen = self._update_local(out_path, merge_remote, default=old_content)
             except BaseException:
                 state["content"], state["version"] = before[0], before[1]
                 if inflight and before[2]:
@@ -830,7 +830,7 @@ class OverleafSync:
                 self._pending_rejection[doc_id] = inflight["base"] if inflight else state.get("pushed_from", state["content"])
                 self._rejected_content[doc_id] = state["content"]
                 try:
-                    local = safe_join(self.output_dir, state["path"]).read_text(encoding="utf-8")
+                    local = self._read_local(safe_join(self.output_dir, state["path"]))
                     self._backup_local(state["path"], local)
                 except (OSError, ValueError, UnicodeDecodeError):
                     pass
@@ -1320,6 +1320,23 @@ class OverleafSync:
             self._warn_once(f"record-doc:{e.errno}", f"cannot keep a copy of {path} ({e}); not deleting it in Overleaf")
             return False
 
+    # -- where a doc's local text lives -------------------------------------------------------
+    # Files on disk by default.  A front-end that holds some docs elsewhere (the language server
+    # keeps open editor buffers) overrides these four; everything else is the same engine.
+
+    def _read_local(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    def _update_local(self, path: Path, fn, default: str | None = None) -> tuple[str, str]:
+        """Replace the local text with fn(text) safely; returns (new text, text fn last saw)."""
+        return update_file(path, fn, default=default)
+
+    def _write_local(self, path: Path, text: str) -> None:
+        atomic_write(path, text)
+
+    def _local_exists(self, path: Path) -> bool:
+        return path.exists()
+
     def _dir_inode(self) -> int | None:
         try:
             return self.output_dir.stat().st_ino
@@ -1341,7 +1358,7 @@ class OverleafSync:
                     continue  # push already running for this doc
                 try:
                     out_path = safe_join(self.output_dir, state["path"])
-                    fc = out_path.read_text(encoding="utf-8")
+                    fc = self._read_local(out_path)
                 except FileNotFoundError:
                     continue
                 except ValueError as e:
@@ -1367,7 +1384,7 @@ class OverleafSync:
                 sanitized = sanitize_non_bmp(fc)
                 if sanitized != fc:
                     try:
-                        atomic_write(out_path, sanitized)
+                        self._write_local(out_path, sanitized)
                     except OSError as e:
                         self._warn_once(f"sanitize:{doc_id}:{e.errno}",
                                         f"{state['path']}: cannot rewrite the file ({e}); not sending it")
@@ -1528,8 +1545,8 @@ class OverleafSync:
             previous_content = state["content"]
             state["content"] = server_content
             state["version"] = new_v
-            update_file(out_path, lambda local: merge3(base, local, server_content),
-                        default=previous_content)
+            self._update_local(out_path, lambda local: merge3(base, local, server_content),
+                               default=previous_content)
         print(f"  [sync] re-synced to server v{new_v}, local edits kept", flush=True)
 
     def _disconnect_ws(self):
@@ -1682,7 +1699,7 @@ class OverleafSync:
                     os.replace(old_file, out_path)
                     print(f"  {_ts()} [sync] {old_path} was renamed in Overleaf → {pathname}", flush=True)
 
-            if out_path.exists() and (not initial or old_content is not None):
+            if self._local_exists(out_path) and (not initial or old_content is not None):
                 branch: list[str] = []
 
                 def reconcile(local_content: str) -> str:
@@ -1703,7 +1720,7 @@ class OverleafSync:
                     branch.append("merge")
                     return merge3(merge_base or "", local_content, server_content)
 
-                _, seen = update_file(out_path, reconcile)
+                _, seen = self._update_local(out_path, reconcile)
                 if initial and seen is not None and seen != server_content and branch == ["merge"]:
                     self._backup_local(pathname, seen)      # keep the pre-merge file too
                 if seen != server_content:
@@ -1714,18 +1731,18 @@ class OverleafSync:
                     else:
                         print(f"  {_ts()} [sync] local edit pending on {pathname} — merged", flush=True)
                     continue
-            if not initial and self.propagate_tree and old_content is not None and not out_path.exists():
+            if not initial and self.propagate_tree and old_content is not None and not self._local_exists(out_path):
                 # Deleted or moved on disk: _tree_scan decides (rewriting it here would bring
                 # back the old name of a rename, and leave a duplicate doc behind).
                 continue
-            if initial and out_path.exists():
+            if initial and self._local_exists(out_path):
                 try:
-                    previous = out_path.read_text(encoding="utf-8")
+                    previous = self._read_local(out_path)
                 except UnicodeDecodeError:
                     previous = None
                 if previous is not None and previous != server_content:
                     self._backup_local(pathname, previous)
-            atomic_write(out_path, server_content)
+            self._write_local(out_path, server_content)
             self._save_base(doc_id, server_content)
             if initial:
                 print(f"  {pathname:<45} v{version}  ({len(server_content)} chars)")
@@ -2082,6 +2099,9 @@ def main(argv: list[str] | None = None):
     args_list = sys.argv[1:] if argv is None else argv
     if args_list and args_list[0] == "init":
         return run_init(args_list[1:])
+    if args_list and args_list[0] == "lsp":
+        from .lsp import main as lsp_main
+        sys.exit(lsp_main(args_list[1:]))
     parser = argparse.ArgumentParser(
         prog="overleaf-sync",
         description="Live two-way sync between an Overleaf project and a local folder.",
