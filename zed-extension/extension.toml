@@ -1,0 +1,11 @@
+id = "overleaf-sync"
+name = "Overleaf Sync"
+description = "Live two-way sync of an Overleaf project through the overleaf-sync language server."
+version = "0.1.0"
+schema_version = 1
+authors = ["Társio Onofrio"]
+repository = "https://github.com/tarsioonofrio/overleaf_sync"
+
+[language_servers.overleaf-sync]
+name = "Overleaf Sync"
+languages = ["LaTeX", "BibTeX"]
