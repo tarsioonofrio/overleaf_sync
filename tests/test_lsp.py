@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+import time
 
 import pytest
 
@@ -360,3 +361,149 @@ def test_a_folder_without_config_gets_a_message_telling_how_to_init(tmp_path):
     shown = [r for r in replies if r.get("method") == "window/showMessage"]
     assert shown and shown[0]["params"]["type"] == 1 and "overleaf-sync init" in shown[0]["params"]["message"]
     assert code == 0
+
+
+# ── presence: cursors of the others, and ours ─────────────────────────────────────────────────────
+
+class FakeWs:
+    def __init__(self):
+        self.sent = []
+
+    def send_event(self, name, args, callback=None):
+        self.sent.append((name, args))
+
+
+@pytest.fixture
+def pres(env):
+    sync = env.sync_
+    sync._ws, ws = FakeWs(), None
+    ws = sync._ws
+    sync._ws_ready.set()
+    changes = []
+    sync.on_peers_changed = lambda: changes.append(1)
+    return env, sync, ws, changes
+
+
+def test_a_collaborators_cursor_becomes_an_inlay_hint_at_that_spot(pres):
+    ed, sync, ws, changes = pres
+    sync._on_peer_update([{"id": "P.a", "doc_id": "d1", "row": 0, "column": 3, "name": "Ana Souza"}])
+    (h,) = sync.peer_hints(ed.uri)
+    assert h["position"] == {"line": 0, "character": 3} and h["label"].endswith("Ana") and "Ana Souza" in h["tooltip"]
+    assert changes == [1]
+    sync._on_peer_update([{"id": "P.a", "doc_id": "d1", "row": 0, "column": 3, "name": "Ana Souza"}])
+    assert changes == [1]                                           # nothing moved: nobody is told again
+
+
+def test_cursors_in_other_documents_or_past_the_end_are_not_shown(pres):
+    ed, sync, ws, _ = pres
+    sync._on_peer_update([{"id": "P.a", "doc_id": "other", "row": 0, "column": 0, "name": "Ana"}])
+    sync._on_peer_update([{"id": "P.b", "doc_id": "d1", "row": 9999, "column": 0, "name": "Bia"}])
+    assert sync.peer_hints(ed.uri) == []
+    sync._on_peer_update([{"id": "P.c", "doc_id": "d1", "row": 0, "column": 9999, "name": "Caio"}])
+    (h,) = sync.peer_hints(ed.uri)
+    assert h["position"]["character"] == len(BASE.split("\n")[0])    # clamped to the end of the line
+
+
+def test_hints_respect_the_requested_range(pres):
+    ed, sync, ws, _ = pres
+    sync._on_peer_update([{"id": "P.a", "doc_id": "d1", "row": 0, "column": 1, "name": "Ana"}])
+    far = {"start": {"line": 5, "character": 0}, "end": {"line": 9, "character": 0}}
+    assert sync.peer_hints(ed.uri, far) == []
+    near = {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}
+    assert len(sync.peer_hints(ed.uri, near)) == 1
+
+
+def test_our_own_echo_is_recognised_and_never_drawn(pres):
+    ed, sync, ws, _ = pres
+    sync.set_cursor(ed.uri, 0, 2)
+    assert ws.sent == [("clientTracking.updatePosition", [{"row": 0, "column": 2, "doc_id": "d1"}])]
+    sync._on_peer_update([{"id": "P.me", "doc_id": "d1", "row": 0, "column": 2, "name": "Me"}])     # the server echoes it
+    assert sync.peer_hints(ed.uri) == [] and sync._own_id == "P.me"
+    sync._on_peer_update([{"id": "P.me", "doc_id": "d1", "row": 1, "column": 0, "name": "Me"}])
+    assert sync.peer_hints(ed.uri) == []                             # later positions of ours are ignored by id
+    sync._on_peer_update([{"id": "P.you", "doc_id": "d1", "row": 1, "column": 0, "name": "You"}])
+    assert len(sync.peer_hints(ed.uri)) == 1
+
+
+def test_the_connected_users_list_replaces_what_we_knew(pres):
+    ed, sync, ws, changes = pres
+    sync._own_id = "P.me"
+    users = [{"client_id": "P.me", "first_name": "M", "cursorData": {"doc_id": "d1", "row": 0, "column": 0}},
+             {"client_id": "P.a", "first_name": "Ana", "last_name": "S", "cursorData": {"doc_id": "d1", "row": 1, "column": 2}},
+             {"client_id": "P.nocursor", "first_name": "Z"}]
+    sync._on_connected_users([None, users])
+    assert [h["label"][-3:] for h in sync.peer_hints(ed.uri)] == ["Ana"]
+    sync._on_connected_users([None, [users[0]]])                     # Ana left
+    assert sync.peer_hints(ed.uri) == [] and changes == [1, 1]
+
+
+def test_a_user_who_left_disappears_at_once(pres):
+    ed, sync, ws, _ = pres
+    sync._on_peer_update([{"id": "P.a", "doc_id": "d1", "row": 0, "column": 1, "name": "Ana"}])
+    sync._on_peer_gone([{"id": "P.a"}])
+    assert sync.peer_hints(ed.uri) == []
+    sync._on_peer_gone(["unknown"])                                  # a shape we do not know must not raise
+
+
+def test_cursor_updates_are_throttled_and_the_last_position_wins(pres):
+    ed, sync, ws, _ = pres
+    sync.set_cursor(ed.uri, 0, 1)
+    sync.set_cursor(ed.uri, 0, 2)
+    sync.set_cursor(ed.uri, 0, 3)
+    assert len(ws.sent) == 1
+    time.sleep(0.4)
+    assert [a[0]["column"] for _, a in ws.sent] == [1, 3]
+    sync.set_cursor(ed.uri, 0, 3)
+    time.sleep(0.3)
+    assert len(ws.sent) == 2                                         # the same place is not sent twice
+
+
+def test_the_cursor_is_not_shared_when_turned_off_or_for_unknown_files(pres, tmp_path):
+    ed, sync, ws, _ = pres
+    sync.share_cursor = False
+    sync.set_cursor(ed.uri, 0, 1)
+    sync.share_cursor = True
+    sync.set_cursor("file:///elsewhere/x.tex", 0, 1)
+    sync.set_cursor("untitled:1", 0, 1)
+    assert ws.sent == []
+
+
+def test_server_takes_the_cursor_from_document_highlight_and_answers_inlay_hints(pres):
+    ed, sync, ws, _ = pres
+    out = io.BytesIO()
+    srv = Server(io.BytesIO(b""), out)
+    srv.sync = sync
+    srv.handle({"jsonrpc": "2.0", "id": 1, "method": "textDocument/documentHighlight",
+                "params": {"textDocument": {"uri": ed.uri}, "position": {"line": 0, "character": 4}}})
+    assert ws.sent and ws.sent[0][1][0]["column"] == 4
+    sync._on_peer_update([{"id": "P.a", "doc_id": "d1", "row": 0, "column": 1, "name": "Ana"}])
+    srv.handle({"jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
+                "params": {"textDocument": {"uri": ed.uri}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}}})
+    srv.show_cursors = False
+    srv.handle({"jsonrpc": "2.0", "id": 3, "method": "textDocument/inlayHint", "params": {"textDocument": {"uri": ed.uri}}})
+    data, replies = out.getvalue(), []
+    while data:
+        head, _, rest = data.partition(b"\r\n\r\n")
+        n = int(head.split(b":")[1]); replies.append(json.loads(rest[:n])); data = rest[n:]
+    assert replies[0]["result"] == [] and len(replies[1]["result"]) == 1 and replies[2]["result"] == []
+
+
+def test_the_editor_is_asked_to_refresh_hints_only_if_it_supports_that(pres):
+    ed, sync, ws, _ = pres
+    out = io.BytesIO()
+    srv = Server(io.BytesIO(b""), out)
+    srv.refresh_hints()
+    assert out.getvalue() == b""
+    srv.hint_refresh = True
+    srv.refresh_hints()
+    srv.refresh_hints()                                              # a burst is one request
+    assert out.getvalue().count(b"workspace/inlayHint/refresh") == 1
+    assert b'"params"' not in out.getvalue()
+
+
+def test_initialize_advertises_cursor_features_and_reads_refresh_support():
+    code, replies = run_session([
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": "file:///tmp/x", "capabilities": {"workspace": {"inlayHint": {"refreshSupport": True}}}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "shutdown"}, {"jsonrpc": "2.0", "method": "exit"}])
+    caps = replies[0]["result"]["capabilities"]
+    assert caps["documentHighlightProvider"] and caps["inlayHintProvider"]

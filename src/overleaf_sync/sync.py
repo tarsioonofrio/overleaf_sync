@@ -1565,6 +1565,9 @@ class OverleafSync:
         except Exception:
             pass
 
+    def _on_ws_created(self, ws) -> None:
+        """Hook for subclasses: every new connection, before it connects (register more event handlers here)."""
+
     def _connect_and_sync_state(self, initial: bool):
         from .client import OverleafSession
 
@@ -1586,6 +1589,7 @@ class OverleafSync:
         for ev in ("reciveNewDoc", "reciveNewFile", "reciveNewFolder",
                    "reciveEntityRename", "reciveEntityMove", "removeEntity"):
             ws.on(ev, on_tree_change)
+        self._on_ws_created(ws)
         ws.connect()
         ws.run_forever()
         try:

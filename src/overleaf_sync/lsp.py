@@ -98,6 +98,154 @@ class LspSync(_sync.OverleafSync):
         self._notify = notify or (lambda kind, msg: None)
         self._open: dict[str, OpenDoc] = {}
         self._olock = threading.RLock()
+        # collaborators' cursors (presence) and ours
+        self.share_cursor = True
+        self.on_peers_changed = None            # called (from a network thread) when the cursors others see changed
+        self._peers: dict[str, dict] = {}       # client id → {name, doc_id, row, column}
+        self._plock = threading.Lock()
+        self._own_id: str | None = None         # our connection's id, learnt from the echo of our own position
+        self._last_sent: tuple | None = None    # (doc_id, row, column)
+        self._last_sent_at = 0.0
+        self._cursor_timer: threading.Timer | None = None
+        self._presence_started = False
+
+    # -- presence: who is where ---------------------------------------------------------------------
+
+    def _on_ws_created(self, ws) -> None:
+        ws.on("clientTracking.clientUpdated", self._on_peer_update)
+        ws.on("clientTracking.clientDisconnected", self._on_peer_gone)
+        if not self._presence_started:
+            self._presence_started = True
+            threading.Thread(target=self._presence_loop, name="overleaf-presence", daemon=True).start()
+
+    def _presence_loop(self) -> None:
+        """Ask who is connected every few seconds: the source of truth for who is still here."""
+        while getattr(self, "_running", True):
+            ws = self._ws
+            if ws is not None and self._ws_ready.is_set():
+                try:
+                    ws.send_event("clientTracking.getConnectedUsers", [], callback=self._on_connected_users)
+                except Exception:
+                    pass
+            time.sleep(3.0)
+
+    def _is_me(self, client_id, doc_id, row, col) -> bool:
+        if client_id is not None and client_id == self._own_id:
+            return True
+        return self._own_id is None and self._last_sent == (doc_id, row, col)
+
+    def _on_peer_update(self, args: list) -> None:
+        d = (args or [{}])[0]
+        if not isinstance(d, dict) or "id" not in d or "row" not in d:
+            return
+        key = (d.get("doc_id"), d["row"], d.get("column", 0))
+        if self._own_id is None and self._last_sent == key:
+            self._own_id = d["id"]                           # the echo of the position we just sent
+            return
+        if d["id"] == self._own_id:
+            return
+        with self._plock:
+            new = {"name": d.get("name") or d.get("email") or "someone", "doc_id": d.get("doc_id"), "row": d["row"], "column": d.get("column", 0)}
+            changed = self._peers.get(d["id"]) != new
+            self._peers[d["id"]] = new
+        if changed:
+            self._peers_changed()
+
+    def _on_peer_gone(self, args: list) -> None:
+        d = (args or [None])[0]
+        cid = d.get("id") if isinstance(d, dict) else d
+        with self._plock:
+            gone = self._peers.pop(cid, None) is not None
+        if gone:
+            self._peers_changed()
+
+    def _on_connected_users(self, data) -> None:
+        try:
+            users = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) else []
+        except Exception:
+            return
+        new = {}
+        for u in users:
+            cur = u.get("cursorData")
+            cid = u.get("client_id")
+            if not cur or cid is None or self._is_me(cid, cur.get("doc_id"), cur.get("row"), cur.get("column")):
+                continue
+            name = " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or u.get("email") or "someone"
+            new[cid] = {"name": name, "doc_id": cur.get("doc_id"), "row": cur.get("row", 0), "column": cur.get("column", 0)}
+        with self._plock:
+            changed = new != self._peers
+            self._peers = new
+        if changed:
+            self._peers_changed()
+
+    def _peers_changed(self) -> None:
+        cb = self.on_peers_changed
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def peer_hints(self, uri: str, rng: dict | None = None) -> list:
+        """Inlay hints that mark where the others' cursors are in this document."""
+        path = uri_to_path(uri)
+        rel = self._rel(path) if path else None
+        if rel is None:
+            return []
+        with self._lock:
+            doc_id = next((i for i, d in self._docs.items() if d["path"] == rel), None)
+        with self._olock:
+            od = self._open.get(rel)
+            lines = (od.pending["text"] if od and od.pending else od.text if od else "").split("\n") if od else []
+        if doc_id is None or not lines:
+            return []
+        with self._plock:
+            peers = [p for p in self._peers.values() if p["doc_id"] == doc_id]
+        hints = []
+        for p in peers:
+            row = p["row"]
+            if row >= len(lines):
+                continue
+            col = min(p["column"], utf16_len(lines[row]))
+            if rng and not ((rng["start"]["line"], rng["start"]["character"]) <= (row, col) <= (rng["end"]["line"], rng["end"]["character"])):
+                continue
+            hints.append({"position": {"line": row, "character": col}, "label": f"\u258f{p['name'].split()[0]}",
+                          "tooltip": f"{p['name']}'s cursor in Overleaf", "paddingLeft": False, "paddingRight": False})
+        return hints
+
+    def set_cursor(self, uri: str, line: int, character: int) -> None:
+        """The editor's cursor moved (reported by the editor's own requests): tell the others, at most ~8 times a second."""
+        if not self.share_cursor:
+            return
+        path = uri_to_path(uri)
+        rel = self._rel(path) if path else None
+        if rel is None:
+            return
+        with self._lock:
+            doc_id = next((i for i, d in self._docs.items() if d["path"] == rel), None)
+        if doc_id is None:
+            return
+        self._cursor_target = (doc_id, line, character)
+        now = time.monotonic()
+        wait = 0.12 - (now - self._last_sent_at)
+        if wait <= 0:
+            self._send_cursor()
+        elif self._cursor_timer is None:
+            self._cursor_timer = threading.Timer(wait, self._send_cursor)
+            self._cursor_timer.daemon = True
+            self._cursor_timer.start()
+
+    def _send_cursor(self) -> None:
+        self._cursor_timer = None
+        target = getattr(self, "_cursor_target", None)
+        ws = self._ws
+        if target is None or target == self._last_sent or ws is None or not self._ws_ready.is_set():
+            return
+        self._last_sent, self._last_sent_at = target, time.monotonic()
+        try:
+            ws.send_event("clientTracking.updatePosition", [{"row": target[1], "column": target[2], "doc_id": target[0]}])
+        except Exception:
+            pass
 
     # -- helpers ----------------------------------------------------------------------------------
 
@@ -299,6 +447,9 @@ class Server:
         self.cfg: dict = {}
         self.compiler: _compile.Compiler | None = None
         self.compile_on_save = False
+        self.show_cursors = True
+        self.hint_refresh = False
+        self._last_refresh = 0.0
         self._compile_lock = threading.Lock()
         self._compile_running = False
         self._compile_pending = False
@@ -330,7 +481,10 @@ class Server:
         with self._wlock:
             rid, self._next_id = self._next_id, self._next_id + 1
             self._callbacks[rid] = callback
-        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
 
     def notify(self, kind: str, msg: str) -> None:
         level = {"error": 1, "warning": 2, "info": 3}.get(kind, 3)
@@ -373,11 +527,15 @@ class Server:
             root_uri = (folders[0]["uri"] if folders else None) or params.get("rootUri")
             self.root = uri_to_path(root_uri) if root_uri else None
             self.options = params.get("initializationOptions") or {}
+            caps = (params.get("capabilities") or {}).get("workspace") or {}
+            self.hint_refresh = bool((caps.get("inlayHint") or {}).get("refreshSupport"))
             self._write({"jsonrpc": "2.0", "id": rid, "result": {
                 "capabilities": {
                     "textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": False}},
                     "executeCommandProvider": {"commands": ["overleaf.status", "overleaf.reloadDocument", "overleaf.confirm", "overleaf.compile"]},
                     "codeActionProvider": True,
+                    "documentHighlightProvider": True,        # editors ask this where the cursor is: that is how others see it
+                    "inlayHintProvider": True,                 # and this is how we show where the others' cursors are
                 },
                 "serverInfo": {"name": "overleaf-sync-lsp"}}})
         elif method == "initialized":
@@ -400,13 +558,32 @@ class Server:
             if self.compile_on_save and self.compiler is not None:
                 self.request_compile(delay=1.5)          # let the last keystrokes reach Overleaf first
         elif method == "textDocument/codeAction":
+            start = (params.get("range") or {}).get("start")
+            if start and self.sync is not None:
+                self.sync.set_cursor(params["textDocument"]["uri"], start["line"], start["character"])
             self._write({"jsonrpc": "2.0", "id": rid, "result": self.code_actions()})
+        elif method == "textDocument/documentHighlight":
+            pos = params.get("position") or {}
+            if self.sync is not None and "line" in pos:
+                self.sync.set_cursor(params["textDocument"]["uri"], pos["line"], pos["character"])
+            self._write({"jsonrpc": "2.0", "id": rid, "result": []})
+        elif method == "textDocument/inlayHint":
+            hints = self.sync.peer_hints(params["textDocument"]["uri"], params.get("range")) if self.sync is not None and self.show_cursors else []
+            self._write({"jsonrpc": "2.0", "id": rid, "result": hints})
         elif method == "workspace/executeCommand":
             result = self.execute(params.get("command"), params.get("arguments") or [])
             self._write({"jsonrpc": "2.0", "id": rid, "result": result})
         elif rid is not None:
             self._write({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}})
         return None
+
+    def refresh_hints(self) -> None:
+        """Others' cursors moved: ask the editor to fetch the inlay hints again (at most a few times a second)."""
+        now = time.monotonic()
+        if not (self.hint_refresh and self.show_cursors) or now - self._last_refresh < 0.3:
+            return
+        self._last_refresh = now
+        self.request("workspace/inlayHint/refresh", None, lambda msg: None)
 
     def code_actions(self) -> list:
         if self.compiler is None:
@@ -502,11 +679,14 @@ class Server:
             return
         opts = {**self.cfg, **self.options}
         self.compile_on_save = bool(opts.get("compile_on_save", False))
+        self.show_cursors = bool(opts.get("show_cursors", True))
         self.compiler = _compile.Compiler(settings["project_id"], cookie, settings["output_dir"], bool(opts.get("compile_pdf", True)))
         self.sync = LspSync(settings["project_id"], cookie, settings["output_dir"],
                             dry_run=settings["dry_run"], allow_wipe=settings["allow_wipe"],
                             propagate_tree=settings["tree_sync"], prune_backups_days=settings["prune_backups_days"],
                             send_request=self.request, notify=self.notify)
+        self.sync.share_cursor = bool(opts.get("share_cursor", True))
+        self.sync.on_peers_changed = self.refresh_hints
 
         def run():
             try:
