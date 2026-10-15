@@ -304,3 +304,37 @@ def test_one_touch_confirms_a_wipe_and_a_delete_waiting_together(env, tmp_path):
         if released:
             break
     assert released == wipe
+
+
+BIG = "".join(f"line {i} of a longer chapter\n" for i in range(40))
+
+
+def test_moved_and_edited_is_a_rename_with_a_copy_kept(env, tmp_path):
+    env._docs["d1"]["content"] = BIG
+    (tmp_path / "main.tex").unlink()
+    (tmp_path / "paper.tex").write_text(BIG.replace("line 7 of", "LINE SEVEN of") + "one more line\n")
+    env.scan(10)
+    assert calls(env) == [("rename_doc", "d1", "paper.tex")]
+    assert next((tmp_path / ".overleaf-sync-backup").rglob("deleted-docs/main.tex")).read_text() == BIG
+
+
+def test_unrelated_new_file_is_not_taken_for_an_edited_move(env, tmp_path):
+    env._docs["d1"]["content"] = BIG
+    (tmp_path / "main.tex").unlink()
+    (tmp_path / "other.tex").write_text("something\nentirely\ndifferent\n")
+    env.scan(10)
+    assert [c[0] for c in calls(env)] == ["create_doc"]          # the delete still waits for confirmation
+
+
+def test_two_equally_similar_candidates_are_not_guessed(env, tmp_path):
+    env._docs["d1"]["content"] = BIG
+    (tmp_path / "main.tex").unlink()
+    (tmp_path / "x.tex").write_text(BIG + "x\n")
+    (tmp_path / "y.tex").write_text(BIG + "y\n")
+    env.scan(10)
+    assert sorted(c[0] for c in calls(env)) == ["create_doc", "create_doc"]
+
+
+def test_huge_texts_are_not_compared(env):
+    assert OverleafSync._similarity("a\n" * 200_000, "a\n" * 200_000 + "b") == 0.0
+    assert OverleafSync._similarity("a\nb\nc\nd\n", "a\nb\nc\nd\ne\n") > 0.85

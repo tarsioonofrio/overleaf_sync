@@ -83,6 +83,18 @@ try:
     (OUT / ".overleaf-sync-confirm-wipe").touch()
     check("6 after `touch` the doc is deleted", wait(lambda: f"{folder}/{name2}" not in server()[0], 60))
     check("6b a copy of the deleted doc is in the backup", any(OUT.glob(f".overleaf-sync-backup/*/deleted-docs/{folder}/{name2}")))
+    # moved AND edited at once: still one doc (same id), with the edit
+    nb, nc = f"treetest-{RUN}-b.tex", f"treetest-{RUN}-c.tex"
+    body = "".join(f"line {i} of the test chapter\n" for i in range(30))
+    (OUT / nb).write_text(body)
+    check("8 second file created", wait(lambda: server()[0].get(nb, (0, None))[1] == body, 60))
+    ident = server()[0][nb][0]
+    (OUT / nb).unlink(); (OUT / nc).write_text(body.replace("line 7 of", "LINE SEVEN of"))
+    check("8b moved+edited: same doc id under the new name, with the edit",
+          wait(lambda: nc in server()[0] and server()[0][nc][1] == body.replace("line 7 of", "LINE SEVEN of"), 90)
+          and server()[0][nc][0] == ident and nb not in server()[0])
+    (OUT / nc).unlink(); time.sleep(8); (OUT / ".overleaf-sync-confirm-wipe").touch()
+    check("8c cleanup delete of the second file", wait(lambda: nc not in server()[0], 60))
     after, _, _ = server()
     check("7 original docs identical at the end", all(after[p][1] == before[p][1] for p in before) and set(after) == set(before), str(sorted(set(after) ^ set(before))))
 finally:

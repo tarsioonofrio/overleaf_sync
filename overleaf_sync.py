@@ -1032,7 +1032,8 @@ class OverleafSync:
     POLL_INTERVAL = 0.5  # seconds between local file checks
 
     def __init__(self, project_id: str, session_cookie: str, output_dir: str,
-                 dry_run: bool = False, allow_wipe: bool = False, propagate_tree: bool = True):
+                 dry_run: bool = False, allow_wipe: bool = False, propagate_tree: bool = True,
+                 prune_backups_days: float | None = None):
         self.project_id = project_id
         self.session_cookie = session_cookie
         self.output_dir = Path(output_dir)
@@ -1051,6 +1052,8 @@ class OverleafSync:
         # propagate_tree: create / rename / delete docs in Overleaf when the local files are
         # created / renamed / deleted (see _tree_scan).  Off → only text edits are synced.
         self.propagate_tree = propagate_tree
+        # prune_backups_days: at start, delete backup runs older than this many days (default: keep all).
+        self.prune_backups_days = prune_backups_days
         self._http = None                         # OverleafSession of the current connection
         self._folders: dict[str, str] = {}        # folder path ("" = root) → folder id
         self._server_paths: set[str] = set()      # every entity path in the project (docs, files, folders)
@@ -1441,6 +1444,19 @@ class OverleafSync:
         "tex latex ltx sty cls bst bib bibtex txt md rmd rnw rtex tikz mtx asy lbx bbx cbx dtx ins ist def clo "
         "ldf lco cfg lua gv mf yml yaml lhs mk xmpdata inc m".split())
 
+    RENAME_SIMILARITY = 0.85
+    SIMILARITY_MAX_CHARS = 300_000
+
+    @classmethod
+    def _similarity(cls, a: str, b: str) -> float:
+        """Line-based likeness (0..1) of two texts; 0 for huge ones (not worth the time)."""
+        if not a.strip() or not b.strip() or max(len(a), len(b)) > cls.SIMILARITY_MAX_CHARS:
+            return 0.0
+        sm = difflib.SequenceMatcher(None, a.splitlines(), b.splitlines(), autojunk=False)
+        if sm.real_quick_ratio() < 0.5 or sm.quick_ratio() < 0.5:
+            return 0.0
+        return sm.ratio()
+
     def _eligible_new_file(self, rel: str, p: Path) -> bool:
         name = rel.rsplit("/", 1)[-1]
         if "." not in name or name.rsplit(".", 1)[1].lower() not in self.TEXT_EXTS:
@@ -1518,6 +1534,20 @@ class OverleafSync:
                 rivals = [m for m in missing if docs[m][1] == docs[d][1]]
                 if len(same) == 1 and len(rivals) == 1:
                     renames[d] = same[0]
+            # Moved AND edited: no identical text, but one clearly-closest candidate each way.
+            left_d = [d for d in missing if d not in renames]
+            left_r = [r for r in new if r not in renames.values() and texts[r] is not None]
+            for d in left_d:
+                scored = sorted(((self._similarity(docs[d][1], texts[r]), r) for r in left_r), reverse=True)
+                if not scored or scored[0][0] < self.RENAME_SIMILARITY:
+                    continue
+                if len(scored) > 1 and scored[1][0] >= self.RENAME_SIMILARITY:
+                    continue                                          # ambiguous
+                r = scored[0][1]
+                back = sorted((self._similarity(docs[m][1], texts[r]) for m in left_d), reverse=True)
+                if len(back) > 1 and back[1] >= self.RENAME_SIMILARITY:
+                    continue
+                renames[d] = r
         renamed_to = set(renames.values())
         actions = [("rename", d, r) for d, r in sorted(renames.items())]
         actions += [("create", r) for r in sorted(new) if r not in renamed_to]
@@ -1616,6 +1646,12 @@ class OverleafSync:
             new_folder, _, new_name = new_rel.rpartition("/")
             if new_rel in self._server_paths:
                 raise RuntimeError(f"{new_rel} already exists in Overleaf")
+            try:
+                edited = local[new_rel].read_text(encoding="utf-8") != docs[doc_id][1]
+            except (OSError, UnicodeDecodeError):
+                edited = False
+            if edited and not self._record_doc_deletion(old_rel, docs[doc_id][1]):
+                raise RuntimeError("could not keep a copy of the document first")
             if old_folder == new_folder:
                 self._http.rename_doc(self.project_id, doc_id, new_name)
             else:
@@ -1630,7 +1666,8 @@ class OverleafSync:
                     self._http.move_doc(self.project_id, doc_id, target)
                 else:
                     raise RuntimeError("both intermediate names are taken in Overleaf")
-            print(f"  {_ts()} [sync] {old_rel} was renamed locally → {new_rel} in Overleaf", flush=True)
+            print(f"  {_ts()} [sync] {old_rel} was renamed locally → {new_rel} in Overleaf"
+                  f"{' (its text was edited too; merged on the re-join)' if edited else ''}", flush=True)
         elif kind == "delete":
             doc_id = key[1]
             path, content = docs[doc_id]
@@ -1924,6 +1961,29 @@ class OverleafSync:
         self._ws_ready_at = _time.monotonic()
         self._ws_ready.set()
 
+    def _prune_backups(self) -> None:
+        """Opt-in: remove whole backup runs (`<timestamp>/`) older than prune_backups_days; never this run's."""
+        if not self.prune_backups_days:
+            return
+        root = self.output_dir / ".overleaf-sync-backup"
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=self.prune_backups_days)
+        try:
+            runs = sorted(root.iterdir())
+        except OSError:
+            return
+        for run in runs:
+            try:
+                when = datetime.datetime.strptime(run.name, "%Y%m%d-%H%M%S")
+            except ValueError:
+                continue                                    # not one of ours: leave it alone
+            if run.name == self._started or when >= cutoff or not run.is_dir() or run.is_symlink():
+                continue
+            try:
+                shutil.rmtree(run)
+                print(f"  {_ts()} [sync] pruned backup {run.name} (older than {self.prune_backups_days:g} days)", flush=True)
+            except OSError as e:
+                self._warn_once(f"prune:{run.name}", f"could not prune {run}: {e}")
+
     def _backup_local(self, pathname: str, content: str) -> None:
         """Keep a copy of a local file we are about to overwrite with the server's."""
         dest = self.output_dir / ".overleaf-sync-backup" / self._started / pathname
@@ -2068,6 +2128,7 @@ class OverleafSync:
         except OSError:
             pass
         self._running = True
+        self._prune_backups()
         try:
             self._connect_and_sync_state(initial=True)
         except Exception as e:
@@ -2183,6 +2244,7 @@ def resolve_settings(args, cfg: dict) -> dict:
         "output_dir": str(Path(output_dir).expanduser()),
         "dry_run": args.dry_run or bool(pick("dry_run")),
         "allow_wipe": args.allow_wipe or bool(pick("allow_wipe")),
+        "prune_backups_days": args.prune_backups if args.prune_backups is not None else pick("prune_backups_days"),
         "tree_sync": not args.no_tree_sync and pick("tree_sync") is not False,
         "allow_unknown_protocol": args.allow_unknown_protocol or bool(pick("allow_unknown_protocol")),
     }
@@ -2289,6 +2351,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--listen", action="store_true", help="one-way mirror Overleaf → local")
     parser.add_argument("--allow-wipe", action="store_true",
                         help="push a file emptied locally without asking (default: hold it until confirmed)")
+    parser.add_argument("--prune-backups", type=float, metavar="DAYS", default=None,
+                        help="at start, delete .overleaf-sync-backup runs older than DAYS days (default: keep everything)")
     parser.add_argument("--no-tree-sync", action="store_true",
                         help="do not create / rename / delete Overleaf documents when local files are created / renamed / deleted")
     parser.add_argument("--allow-unknown-protocol", action="store_true",
@@ -2346,6 +2410,7 @@ def main(argv: list[str] | None = None):
             dry_run=settings["dry_run"],
             allow_wipe=settings["allow_wipe"],
             propagate_tree=settings["tree_sync"],
+            prune_backups_days=settings["prune_backups_days"],
         ).run()
 
 
