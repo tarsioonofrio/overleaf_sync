@@ -1,7 +1,7 @@
 import re, sys, json, html, requests
+# usage: setup_local_overleaf.py <activation token> <user id>   (printed by create-user.mjs)
 B="http://127.0.0.1:18080"
-tok="0e5627fcdf6cf784ca024d2f92837ab20e18af96b1448364d57f50d1c8a65e8f"
-uid="6aceed6b82099cdc1b1f4bcd"
+tok, uid = sys.argv[1], sys.argv[2]
 PW="Test-pass-12345!xyz"
 s=requests.Session()
 def csrf(url):

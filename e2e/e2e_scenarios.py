@@ -180,7 +180,7 @@ def proc_stats(pid):
 
 def sc_soak():
     """K: 5 minutes of low-rate edits from both sides; resources must stay flat, nothing lost."""
-    r=random.Random(11); toks=[]; samples=[]; end=time.time()+300; n=0; nxt=0
+    r=random.Random(11); toks=[]; samples=[]; end=time.time()+int(os.environ.get("SOAK_SECS","300")); n=0; nxt=0
     while time.time()<end:
         n+=1; tok=f"<<SOAK{RUN}-{n}>>"
         if r.random()<0.5:
