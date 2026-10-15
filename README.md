@@ -6,8 +6,9 @@ Bidirectional live sync between Overleaf and an AI coding agent — without goin
 
 | Path | What |
 |---|---|
-| `overleaf_sync.py` | the sync (`overleaf-sync` command) |
-| `overleaf_cli.py` | Overleaf web/realtime client it uses (also a small debugging CLI) |
+| `src/overleaf_sync/sync.py` | the file-sync daemon, `init`, and the `overleaf-sync` command |
+| `src/overleaf_sync/ot.py` | pure text / operational-transformation helpers (diff, apply, transform, 3-way merge) |
+| `src/overleaf_sync/client.py` | Overleaf web and real-time client (also a small debugging CLI: `python -m overleaf_sync.client`) |
 | `tests/` | unit tests: `pip install -e ".[test]" && pytest` |
 | `e2e/` | end-to-end scripts against a throw-away self-hosted Overleaf or a throw-away project (see `e2e/README.md`) |
 | `contrib/` | systemd user unit |

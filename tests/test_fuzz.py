@@ -6,7 +6,7 @@ import random
 
 import pytest
 
-from overleaf_sync import (
+from overleaf_sync.sync import (
     apply_sharejs_ops, apply_wire_ops, compute_ot_ops, merge3, ops_to_wire,
     sanitize_non_bmp, transform_x,
 )
@@ -105,7 +105,7 @@ def test_merge3_never_loses_untouched_text(seed):
 
 import time
 
-from overleaf_sync import wire_to_cp  # noqa: F401
+from overleaf_sync.sync import wire_to_cp  # noqa: F401
 
 
 def _doc(n=300):

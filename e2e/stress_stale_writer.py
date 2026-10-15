@@ -6,8 +6,8 @@ were lost or duplicated.  Usage: stress_stale_writer.py [seconds] [seed]
 """
 import os, random, sys, tempfile, threading, time
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import overleaf_sync as o
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
+import overleaf_sync.sync as o
 
 secs = float(sys.argv[1]) if len(sys.argv) > 1 else 15
 seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1

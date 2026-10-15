@@ -8,7 +8,7 @@ must yield exactly new.
 from __future__ import annotations
 
 import pytest
-from overleaf_sync import compute_ot_ops, apply_sharejs_ops
+from overleaf_sync.sync import compute_ot_ops, apply_sharejs_ops
 
 
 def server_apply(content: str, ops: list[dict]) -> str:

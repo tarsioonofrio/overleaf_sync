@@ -8,8 +8,8 @@ import threading
 
 import pytest
 
-import overleaf_sync
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import OverleafSync
 
 BASE = "alpha\nbeta\ngamma\n"
 
@@ -96,7 +96,7 @@ def test_garbage_ot_error_does_not_raise(tmp_path):
 # ── the server announces a protocol stage we do not know ────────────────────────────────────────
 
 def _bootstrap_with(monkeypatch, stage):
-    import overleaf_cli
+    from overleaf_sync import client as overleaf_cli
 
     meta = '<meta name="ol-csrfToken" content="tok">' + (
         "" if stage is None else f'<meta name="ol-otMigrationStage" content="{stage}">')
@@ -117,13 +117,13 @@ def test_known_protocol_stages_are_accepted(monkeypatch, stage):
 
 @pytest.mark.parametrize("stage", [1, 2, 99, "weird"])
 def test_unknown_protocol_stage_is_refused(monkeypatch, stage):
-    import overleaf_cli
+    from overleaf_sync import client as overleaf_cli
     with pytest.raises(overleaf_cli.UnsupportedProtocol) as e:
         _bootstrap_with(monkeypatch, stage).get_project_bootstrap("a" * 24)
     assert "--allow-unknown-protocol" in str(e.value)
 
 
 def test_unknown_protocol_can_be_overridden(monkeypatch):
-    import overleaf_cli
+    from overleaf_sync import client as overleaf_cli
     monkeypatch.setattr(overleaf_cli, "ALLOW_UNKNOWN_PROTOCOL", True)
     assert _bootstrap_with(monkeypatch, 1).get_project_bootstrap("a" * 24)

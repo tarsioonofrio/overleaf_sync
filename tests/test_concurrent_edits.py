@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from overleaf_sync import OverleafSync, apply_sharejs_ops, compute_ot_ops, transform_x
+from overleaf_sync.sync import OverleafSync, apply_sharejs_ops, compute_ot_ops, transform_x
 
 
 class FakeServer:

@@ -6,7 +6,7 @@ Payloads are copied from live otUpdateApplied events (2026-10-07).
 
 from __future__ import annotations
 
-from overleaf_sync import OverleafSync
+from overleaf_sync.sync import OverleafSync
 
 
 def _sync(tmp_path, content="abc", version=10):

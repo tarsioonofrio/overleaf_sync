@@ -32,10 +32,10 @@ CHROMIUM = os.environ.get("CHROMIUM", "/usr/bin/chromium")
 CHROMEDRIVER = os.environ.get("CHROMEDRIVER", "/usr/bin/chromedriver")
 SYNC_CMD = os.environ.get("OVERLEAF_SYNC", "overleaf-sync")
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / 'src'))
 os.environ["OVERLEAF_URL"] = URL
-import overleaf_cli                                        # noqa: E402
-from overleaf_sync import (TrackingSocketIOClient, collect_docs_from_project,  # noqa: E402
+from overleaf_sync import client as overleaf_cli                                        # noqa: E402
+from overleaf_sync.sync import (TrackingSocketIOClient, collect_docs_from_project,  # noqa: E402
                            compute_ot_ops, ops_to_wire)
 
 RUN = str(int(time.time()))

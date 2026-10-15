@@ -1,7 +1,7 @@
 """Backup pruning is opt-in, removes only old timestamped runs, and never the current one."""
 import datetime
 
-from overleaf_sync import OverleafSync
+from overleaf_sync.sync import OverleafSync
 
 
 def runs(tmp_path, names):

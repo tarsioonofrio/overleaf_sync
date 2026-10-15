@@ -10,7 +10,7 @@ import random
 
 import pytest
 
-from overleaf_sync import apply_wire_ops, compute_ot_ops, ops_to_wire
+from overleaf_sync.sync import apply_wire_ops, compute_ot_ops, ops_to_wire
 
 
 def _u16(s: str) -> bytes:
@@ -91,7 +91,7 @@ def test_random_roundtrip(seed):
 
 # ── non-BMP sanitization (Overleaf stores each non-BMP char as U+FFFD U+FFFD) ──
 
-from overleaf_sync import OverleafSync, sanitize_non_bmp  # noqa: E402
+from overleaf_sync.sync import OverleafSync, sanitize_non_bmp  # noqa: E402
 
 
 def overleaf_server_store(content: str) -> str:

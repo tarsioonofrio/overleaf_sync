@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import overleaf_sync
-from overleaf_sync import parse_project_ref, render_config, ensure_gitignore, resolve_settings, load_config, run_init
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import parse_project_ref, render_config, ensure_gitignore, resolve_settings, load_config, run_init
 
 PID = "6acf945e5bec579b3cef366d"
 

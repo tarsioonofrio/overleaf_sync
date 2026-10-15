@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from overleaf_sync import decode_doc_line
+from overleaf_sync.sync import decode_doc_line
 
 
 def _server_encode(line: str) -> str:

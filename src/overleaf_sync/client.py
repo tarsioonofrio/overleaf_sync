@@ -16,13 +16,13 @@ STEP 6: Live edit       → joinProject → joinDoc → applyOtUpdate (ShareJS o
 STEP 7: Compile         → POST /project/{id}/compile
 
 Usage:
-  python3 overleaf_cli.py --cookie <overleaf_session2> info <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> read <project_id> <file_path>
-  python3 overleaf_cli.py --cookie <overleaf_session2> history <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> connect <project_id>
-  python3 overleaf_cli.py --cookie <overleaf_session2> edit <project_id> <doc_id> <position> <text>
-  python3 overleaf_cli.py --cookie <overleaf_session2> compile <project_id>
-  python3 overleaf_cli.py analyze-har <har_file>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> info <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> read <project_id> <file_path>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> history <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> connect <project_id>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> edit <project_id> <doc_id> <position> <text>
+  python3 -m overleaf_sync.client --cookie <overleaf_session2> compile <project_id>
+  python3 -m overleaf_sync.client analyze-har <har_file>
 """
 
 import argparse

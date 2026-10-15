@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import overleaf_sync
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import OverleafSync
 
 BASE = "line one\nline two\nline three\nline four\n"
 
@@ -182,7 +182,7 @@ def test_a_new_doc_on_reconnect_keeps_an_existing_local_file(tmp_path, monkeypat
 
 
 def test_reserved_names_cannot_be_doc_paths():
-    from overleaf_sync import is_safe_relpath
+    from overleaf_sync.sync import is_safe_relpath
     for bad in [".overleaf-sync-confirm-wipe", ".overleaf-sync-base/.project", "a/.overleaf-sync-base/x",
                 ".overleaf-sync.lock", ".overleaf-sync-backup/x", "x.sync-tmp"]:
         assert not is_safe_relpath(bad), bad
@@ -210,7 +210,7 @@ def test_recording_a_deletion_happens_once_and_only_for_a_push_that_can_go(tmp_p
 
 
 def test_wire_ops_with_astral_chars_keep_positions_straight():
-    from overleaf_sync import wire_to_cp
+    from overleaf_sync.sync import wire_to_cp
     doc = "a\U0001F600b\U0001F600c"                                    # each emoji is 2 UTF-16 units
     ops = [{"p": 3, "i": "X"}, {"p": 6, "d": "\U0001F600"}]           # after X: 'a😀bXc'... second op deletes the 2nd emoji
     cp = wire_to_cp(doc, [{"p": 3, "i": "X"}])

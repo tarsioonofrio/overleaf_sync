@@ -1,8 +1,8 @@
 import os, random, sys, threading, time
 from pathlib import Path
-import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO)
+import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO + '/src')
 import tempfile
-from overleaf_sync import OverleafSync
+from overleaf_sync.sync import OverleafSync
 out=Path(tempfile.mkdtemp()); base="\n".join(f"line {i}" for i in range(200))
 (out/"main.tex").write_text(base)
 s=OverleafSync("p","c",str(out)); s._docs["d1"]={"content":base,"version":0,"path":"main.tex"}
@@ -24,7 +24,7 @@ def wrapped(args):
     gone=[t for t in before if t not in cur]
     if gone and not dbg:
         dbg.append((args[0]["v"],gone))
-        from overleaf_sync import compute_ot_ops, transform_x, apply_sharejs_ops, wire_to_cp
+        from overleaf_sync.sync import compute_ot_ops, transform_x, apply_sharejs_ops, wire_to_cp
         remote=wire_to_cp(state_before,args[0]["op"])
         lo=compute_ot_ops(state_before,file_before); _,rt=transform_x(lo,remote)
         pure=apply_sharejs_ops(file_before,rt)

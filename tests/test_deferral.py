@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import overleaf_sync
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import OverleafSync
 
 def test_a_writer_that_never_pauses_is_still_pushed(tmp_path, monkeypatch):
     sync = OverleafSync("pid", "cookie", str(tmp_path))
@@ -39,7 +39,7 @@ def _records(tmp_path):
 
 
 def test_deleted_text_is_recorded_before_the_push(tmp_path):
-    from overleaf_sync import compute_ot_ops
+    from overleaf_sync.sync import compute_ot_ops
     sync = OverleafSync("pid", "cookie", str(tmp_path))
     old = "keep this\ncoauthor sentence that must stay recoverable\ntail\n"
     new = "keep this\ntail\n"
@@ -52,14 +52,14 @@ def test_deleted_text_is_recorded_before_the_push(tmp_path):
 
 
 def test_nothing_recorded_for_additions(tmp_path):
-    from overleaf_sync import compute_ot_ops
+    from overleaf_sync.sync import compute_ot_ops
     sync = OverleafSync("pid", "cookie", str(tmp_path))
     sync._snapshot_before_delete("main.tex", "abc", compute_ot_ops("abc", "abc more"))
     assert not (tmp_path / ".overleaf-sync-backup").exists()
 
 
 def test_big_deletion_also_keeps_a_full_copy_and_copies_are_pruned(tmp_path):
-    from overleaf_sync import compute_ot_ops
+    from overleaf_sync.sync import compute_ot_ops
     sync = OverleafSync("pid", "cookie", str(tmp_path))
     sync.SNAPSHOT_MAX_FILES = 3
     old = "x" * 3000
@@ -71,7 +71,7 @@ def test_big_deletion_also_keeps_a_full_copy_and_copies_are_pruned(tmp_path):
 
 
 def test_record_keeps_the_whole_line_when_only_part_differs(tmp_path):
-    from overleaf_sync import compute_ot_ops
+    from overleaf_sync.sync import compute_ot_ops
     sync = OverleafSync("pid", "cookie", str(tmp_path))
     old = "<<TOKEN-30>>\n<<TOKEN-31>>\n"
     new = "<<TOKEN-31>>\n"                      # the diff may delete just "30>>\n<<TOKEN-" and keep the shared prefix

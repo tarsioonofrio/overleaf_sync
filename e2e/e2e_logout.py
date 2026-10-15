@@ -4,7 +4,7 @@ B="http://127.0.0.1:18080"; st=json.load(open("/tmp/olt/state.json")); PID=st["p
 env=dict(os.environ,OVERLEAF_URL=B,OVERLEAF_COOKIE_NAME="overleaf.sid")
 shutil_out="/tmp/olt/out3"; subprocess.run(["rm","-rf",shutil_out])
 log=open("/tmp/olt/log3.txt","w")
-p=subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I",REPO+"/overleaf_sync.py",PID,"--cookie",C,"--output-dir",shutil_out],stdout=log,stderr=log,env=env)
+p=subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I","-m","overleaf_sync",PID,"--cookie",C,"--output-dir",shutil_out],stdout=log,stderr=log,env=env)
 time.sleep(12)
 s=requests.Session(); s.cookies.set("overleaf.sid",C,domain="127.0.0.1")
 t=s.get(f"{B}/project").text; csrf=html.unescape(re.search(r'name="ol-csrfToken"[^>]*content="([^"]*)"',t).group(1))

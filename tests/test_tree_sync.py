@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-import overleaf_sync
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import OverleafSync
 
 A = "alpha text\nsecond line\n"
 B = "beta text\n"

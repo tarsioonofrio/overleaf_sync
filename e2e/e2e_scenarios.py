@@ -1,10 +1,10 @@
 import json, os, subprocess, sys, time, shutil, threading, re, html
 from pathlib import Path
-import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO)
+import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO + '/src')
 os.environ["OVERLEAF_URL"]="http://127.0.0.1:18080"; os.environ["OVERLEAF_COOKIE_NAME"]="overleaf.sid"
 import requests
-from overleaf_cli import OverleafSession
-from overleaf_sync import TrackingSocketIOClient, collect_docs_from_project, compute_ot_ops, ops_to_wire
+from overleaf_sync.client import OverleafSession
+from overleaf_sync.sync import TrackingSocketIOClient, collect_docs_from_project, compute_ot_ops, ops_to_wire
 
 st=json.load(open("/tmp/olt/state.json")); PID=st["project"]; COOKIE=st["cookie"]["overleaf.sid"]
 OUT=Path("/tmp/olt/out"); LOG=Path("/tmp/olt/sync.log")
@@ -31,7 +31,7 @@ class Remote:
 
 def start_sync(extra=()):
     f=open(LOG,"a")
-    return subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I",REPO+"/overleaf_sync.py",PID,"--cookie",COOKIE,"--output-dir",str(OUT),*extra],stdout=f,stderr=f,env=os.environ)
+    return subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I","-m","overleaf_sync",PID,"--cookie",COOKIE,"--output-dir",str(OUT),*extra],stdout=f,stderr=f,env=os.environ)
 def wait(cond,t=15):
     e=time.time()+t
     while time.time()<e:

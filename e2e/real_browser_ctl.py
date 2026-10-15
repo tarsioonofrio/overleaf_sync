@@ -7,9 +7,9 @@ The project must be a throw-away one: `restore` rewrites main.tex and sample.bib
 """
 import os, re, struct, subprocess, sys, time, random, threading
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 for k in ("OVERLEAF_URL", "OVERLEAF_COOKIE_NAME", "OVERLEAF_COOKIE"): os.environ.pop(k, None)
-import overleaf_cli, overleaf_sync as osy
+from overleaf_sync import client as overleaf_cli, sync as osy
 
 PID = os.environ["OVERLEAF_PROJECT"]
 OUT = Path("/tmp/olt/ol_br"); LOG = Path("/tmp/olt/br_sync.log"); PIDF = Path("/tmp/olt/br_sync.pid")

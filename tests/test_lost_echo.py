@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from overleaf_sync import OverleafSync, apply_sharejs_ops, compute_ot_ops
+from overleaf_sync.sync import OverleafSync, apply_sharejs_ops, compute_ot_ops
 
 
 class FakeWS:
@@ -119,7 +119,7 @@ def test_error_before_the_look_alike_ack_is_handled_too(tmp_path):
 
 
 def test_over_limit_content_is_never_sent(tmp_path):
-    import overleaf_sync as o
+    import overleaf_sync.sync as o
     sync = _setup(tmp_path, "x", "x")
     sync._docs["d1"].pop("inflight")
     sync._docs["d1"]["content"] = "x"

@@ -1,8 +1,8 @@
 import os, sys, time, subprocess, threading, random, shutil
 from pathlib import Path
-import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO)
+import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO + '/src')
 for k in ("OVERLEAF_URL", "OVERLEAF_COOKIE_NAME", "OVERLEAF_COOKIE"): os.environ.pop(k, None)
-import overleaf_cli, overleaf_sync as osy
+from overleaf_sync import client as overleaf_cli, sync as osy
 PID = os.environ["OVERLEAF_PROJECT"]   # a throw-away project you own
 COOKIE = osy.load_overleaf_cookie()                    # from Firefox, never printed
 ORIG = Path("/tmp/olt/main.original.tex").read_text()

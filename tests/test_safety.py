@@ -12,9 +12,9 @@ try:
 except ImportError:  # only needed to import overleaf_cli, not exercised here
     sys.modules["websocket"] = types.ModuleType("websocket")
 
-import overleaf_sync
-from overleaf_cli import SocketIOClient
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.client import SocketIOClient
+from overleaf_sync.sync import OverleafSync
 
 
 def _sync(tmp_path, content="x" * 500):
@@ -77,7 +77,7 @@ def test_join_doc_timeout_is_an_error_not_an_empty_doc(monkeypatch):
     class Never:
         def wait(self, timeout=None): return False
         def set(self): pass
-    monkeypatch.setattr("overleaf_cli.threading.Event", Never)
+    monkeypatch.setattr("overleaf_sync.client.threading.Event", Never)
     with pytest.raises(RuntimeError):
         c.join_doc("d1")
 
@@ -276,7 +276,7 @@ def test_empty_cookie_file_is_an_error(tmp_path):
 
 
 def test_login_redirect_is_reported_as_auth_error(monkeypatch):
-    from overleaf_cli import AuthError, OverleafSession
+    from overleaf_sync.client import AuthError, OverleafSession
     class Resp:
         status_code = 200; url = "http://x/login?redir=/project/1"; text = ""
         def raise_for_status(self): pass
@@ -287,7 +287,7 @@ def test_login_redirect_is_reported_as_auth_error(monkeypatch):
 
 
 def test_cookie_domain_for_dotless_hosts():
-    from overleaf_cli import _cookie_domain
+    from overleaf_sync.client import _cookie_domain
     assert _cookie_domain("localhost") == "localhost.local"
     assert _cookie_domain("overleaf") == "overleaf.local"
     assert _cookie_domain("www.overleaf.com") == "www.overleaf.com"
@@ -295,7 +295,7 @@ def test_cookie_domain_for_dotless_hosts():
 
 
 def test_session_cookie_is_sent_to_localhost():
-    import overleaf_cli
+    from overleaf_sync import client as overleaf_cli
     overleaf_cli.configure("http://localhost:8080")
     try:
         s = overleaf_cli.OverleafSession("s%3Aabc")
@@ -326,7 +326,7 @@ def test_firefox_cookie_in_the_wal_file_is_read(tmp_path, monkeypatch):
 
 
 def test_cookie_expiry_is_described_and_flagged_when_close():
-    from overleaf_sync import describe_cookie_expiry as d
+    from overleaf_sync.sync import describe_cookie_expiry as d
     assert d(None) == ("unknown (session cookie, or not read from Firefox)", False)
     assert d(1000.0 + 3 * 86400, now=1000.0) == ("expires in 3.0 days as saved in Firefox", False)
     text, urgent = d(1000.0 + 7200, now=1000.0)

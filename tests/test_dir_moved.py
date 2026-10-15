@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from overleaf_sync import OverleafSync
+from overleaf_sync.sync import OverleafSync
 
 
 class _FakeWS:

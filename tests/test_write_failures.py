@@ -7,8 +7,8 @@ import os
 
 import pytest
 
-import overleaf_sync
-from overleaf_sync import OverleafSync
+import overleaf_sync.sync as overleaf_sync
+from overleaf_sync.sync import OverleafSync
 
 BASE = "alpha\nbeta\ngamma\n"
 
@@ -104,7 +104,7 @@ def test_failed_write_in_a_readonly_dir_reverts_state(tmp_path, monkeypatch):
 # ── HTTP 429 ─────────────────────────────────────────────────────────────────────────────────────
 
 def test_rate_limit_carries_retry_after():
-    from overleaf_cli import RateLimited
+    from overleaf_sync.client import RateLimited
     assert RateLimited("17").retry_after == 17
     assert RateLimited("999999").retry_after == 600          # capped
     assert RateLimited("Wed, 21 Oct 2026 07:28:00 GMT").retry_after is None
@@ -112,7 +112,7 @@ def test_rate_limit_carries_retry_after():
 
 
 def test_bootstrap_429_raises_rate_limited(monkeypatch):
-    import overleaf_cli
+    from overleaf_sync import client as overleaf_cli
 
     class R:
         status_code, url, headers, text = 429, "https://x/project/y", {"Retry-After": "9"}, ""

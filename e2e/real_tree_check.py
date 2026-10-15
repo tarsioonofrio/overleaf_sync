@@ -2,10 +2,10 @@
 Usage: OVERLEAF_PROJECT=<id> python e2e/real_tree_check.py   (cookie from Firefox or OVERLEAF_COOKIE)"""
 import os, sys, time, subprocess, shutil
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 if not os.environ.get("TREE_CHECK_KEEP_ENV"):          # set it to run against a self-hosted CE (OVERLEAF_URL, OVERLEAF_COOKIE_NAME, OVERLEAF_COOKIE)
     for k in ("OVERLEAF_URL", "OVERLEAF_COOKIE_NAME"): os.environ.pop(k, None)
-import overleaf_cli, overleaf_sync as osy
+from overleaf_sync import client as overleaf_cli, sync as osy
 
 PID = os.environ["OVERLEAF_PROJECT"]
 COOKIE = osy.load_overleaf_cookie()

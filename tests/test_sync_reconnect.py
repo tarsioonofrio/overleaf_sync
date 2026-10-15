@@ -29,7 +29,7 @@ from __future__ import annotations
 import random
 
 import pytest
-from overleaf_sync import compute_ot_ops, apply_sharejs_ops
+from overleaf_sync.sync import compute_ot_ops, apply_sharejs_ops
 
 
 # ---------------------------------------------------------------------------
