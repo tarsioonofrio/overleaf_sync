@@ -312,8 +312,8 @@ def test_firefox_cookie_in_the_wal_file_is_read(tmp_path, monkeypatch):
     con = sqlite3.connect(db)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA wal_autocheckpoint=0")
-    con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER)")
-    con.execute("INSERT INTO moz_cookies VALUES ('overleaf_session2', 'OLD', '.overleaf.com', 1)")
+    con.execute("CREATE TABLE moz_cookies (name TEXT, value TEXT, host TEXT, lastAccessed INTEGER, expiry INTEGER)")
+    con.execute("INSERT INTO moz_cookies VALUES ('overleaf_session2', 'OLD', '.overleaf.com', 1, 0)")
     con.commit(); con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     con.execute("UPDATE moz_cookies SET value='FRESH', lastAccessed=2")
     con.commit()                                   # now only in the -wal file
@@ -322,3 +322,13 @@ def test_firefox_cookie_in_the_wal_file_is_read(tmp_path, monkeypatch):
     got = overleaf_sync.load_overleaf_cookie(cookie_db=str(db), url="https://www.overleaf.com", cookie_name="overleaf_session2")
     con.close()
     assert got == "FRESH"
+    assert overleaf_sync.COOKIE_EXPIRY is None          # expiry 0 = a session cookie
+
+
+def test_cookie_expiry_is_described_and_flagged_when_close():
+    from overleaf_sync import describe_cookie_expiry as d
+    assert d(None) == ("unknown (session cookie, or not read from Firefox)", False)
+    assert d(1000.0 + 3 * 86400, now=1000.0) == ("expires in 3.0 days as saved in Firefox", False)
+    text, urgent = d(1000.0 + 7200, now=1000.0)
+    assert urgent and "2.0 h" in text
+    assert d(500.0, now=1000.0)[1] is True

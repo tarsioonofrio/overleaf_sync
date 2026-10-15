@@ -38,6 +38,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time as _time_mod
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -141,6 +142,21 @@ def read_cookie_file(path: str) -> str:
     return value
 
 
+COOKIE_EXPIRY: float | None = None     # epoch seconds, when the cookie came from Firefox
+
+
+def describe_cookie_expiry(expiry: float | None, now: float | None = None) -> tuple[str, bool]:
+    """(text, urgent) for the saved expiry of the session cookie."""
+    if not expiry:
+        return "unknown (session cookie, or not read from Firefox)", False
+    left = expiry - (now if now is not None else _time_mod.time())
+    if left <= 0:
+        return "already expired as saved in Firefox (log in again if the server rejects it)", True
+    if left < 86400:
+        return f"expires in {left / 3600:.1f} h as saved in Firefox", True
+    return f"expires in {left / 86400:.1f} days as saved in Firefox", False
+
+
 def load_overleaf_cookie(
     explicit_cookie: str | None = None,
     firefox_profile: str | None = None,
@@ -208,7 +224,7 @@ def load_overleaf_cookie(
             with sqlite3.connect(tmp_db) as conn:
                 row = conn.execute(
                     """
-                    SELECT value, lastAccessed
+                    SELECT value, lastAccessed, expiry
                     FROM moz_cookies
                     WHERE name = ?
                       AND host IN (?, ?, ?)
@@ -224,6 +240,9 @@ def load_overleaf_cookie(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if best_row and best_row[0]:
+        global COOKIE_EXPIRY
+        exp = best_row[2] or 0
+        COOKIE_EXPIRY = float(exp / 1000 if exp > 1e11 else exp) or None     # some Firefox versions store ms
         return best_row[0]
 
     print(
@@ -1039,6 +1058,10 @@ class OverleafSync:
         self._tree_seen: dict[tuple, float] = {}  # pending tree action → first time seen
         self._tree_warned_at: dict[tuple, float] = {}
         self._tree_retry_at: dict[tuple, float] = {}
+        # One `touch` confirms everything that was already waiting for it (emptied files, deletions,
+        # big batches): items register when they warn, the sentinel is consumed once.
+        self._confirm_waiting: dict[tuple, float] = {}    # item → wall time of its warning
+        self._confirmed: set[tuple] = set()
 
         self._lock = threading.Lock()
         # doc_id → {content, version, path}
@@ -1262,6 +1285,24 @@ class OverleafSync:
     MAX_DEFER_SECS = 3.0
     BIG_DELETE_MIN_CHARS = 200
 
+    def _take_confirmations(self) -> None:
+        """Consume the sentinel, if any, on behalf of every item whose warning it follows."""
+        sentinel = self.output_dir / self.WIPE_SENTINEL
+        try:
+            made = sentinel.stat().st_mtime
+        except OSError:
+            return
+        ok = {k for k, warned in self._confirm_waiting.items() if made >= warned - 1.0}
+        if not ok:
+            return                      # a stray or old sentinel must not approve what nobody has seen
+        self._confirmed |= ok
+        for k in ok:
+            del self._confirm_waiting[k]
+        try:
+            sentinel.unlink()
+        except OSError:
+            pass
+
     @classmethod
     def _is_big_delete(cls, old: str, new: str) -> bool:
         if not old.strip():
@@ -1283,26 +1324,21 @@ class OverleafSync:
         current = set()
         sentinel = self.output_dir / self.WIPE_SENTINEL
         wipes = [d for d, old, new in changes if self._is_wipe(old, new)]
-        if wipes and not self.allow_wipe and sentinel.exists():
-            # Only a confirmation made after the warning counts (a stray or old
-            # sentinel must not approve a wipe nobody has seen yet).
-            try:
-                made = sentinel.stat().st_mtime
-            except OSError:
-                made = None
-            ok = [d for d in wipes if made is not None and d in self._wipe_warned_at
-                  and made >= self._wipe_warned_at[d] - 1.0]
-            if ok:
-                self._wipe_ok.update(ok)
-                try:
-                    sentinel.unlink()
-                except OSError:
-                    pass
+        if wipes and not self.allow_wipe:
+            for d in wipes:
+                if d in self._wipe_warned_at:
+                    self._confirm_waiting.setdefault(("wipe", d), self._wipe_warned_at[d])
+            self._take_confirmations()
+            for d in wipes:
+                if ("wipe", d) in self._confirmed:
+                    self._confirmed.discard(("wipe", d))
+                    self._wipe_ok.add(d)
         for doc_id, old, new in changes:
             current.add(doc_id)
             if self._is_wipe(old, new) and not self.allow_wipe and doc_id not in self._wipe_ok:
                 path = self._docs[doc_id]["path"]
                 self._wipe_warned_at.setdefault(doc_id, _time.time())
+                self._confirm_waiting.setdefault(("wipe", doc_id), self._wipe_warned_at[doc_id])
                 self._warn_once(
                     f"wipe:{doc_id}",
                     f"{path} was emptied locally; NOT sending it ({len(old)} chars would be deleted "
@@ -1313,6 +1349,8 @@ class OverleafSync:
                 self._wipe_ok.discard(doc_id)
                 self._warned.discard(f"wipe:{doc_id}")
                 self._wipe_warned_at.pop(doc_id, None)
+                self._confirm_waiting.pop(("wipe", doc_id), None)
+                self._confirmed.discard(("wipe", doc_id))
             seen = self._candidates.get(doc_id)       # (content, stable since, dirty since)
             if seen is None:
                 self._candidates[doc_id] = (new, now, now)
@@ -1338,6 +1376,8 @@ class OverleafSync:
         for gone in [d for d in self._wipe_warned_at if d not in current]:
             del self._wipe_warned_at[gone]
             self._warned.discard(f"wipe:{gone}")
+            self._confirm_waiting.pop(("wipe", gone), None)
+            self._confirmed.discard(("wipe", gone))
         return ready
 
     # The last version both sides agreed on, kept on disk per doc, so edits made
@@ -1489,6 +1529,8 @@ class OverleafSync:
                 del self._tree_seen[key]
                 self._tree_warned_at.pop(key, None)
                 self._warned.discard(("tree-warn", key))
+                self._confirm_waiting.pop(key, None)
+                self._confirmed.discard(key)
         for key in actions:
             self._tree_seen.setdefault(key, now)
         ready = [k for k in actions if now - self._tree_seen[k] >= self.TREE_HOLD_SECS
@@ -1510,17 +1552,11 @@ class OverleafSync:
                 what = "deleted locally" if not bulk else "created or moved at once"
                 print(f"  {_ts()} [sync] {len(fresh)} file(s) {what}: {names}{more}. NOT changing them in "
                       f"Overleaf. Restore the file (or restart the sync) to cancel, or confirm with: touch {shlex.quote(str(sentinel))}", flush=True)
-            try:
-                made = sentinel.stat().st_mtime
-            except OSError:
-                made = None
-            confirmed = {k for k in needs if made is not None and made >= self._tree_warned_at[k] - 1.0}
-            if confirmed:
-                try:
-                    sentinel.unlink()
-                except OSError:
-                    pass
-            ready = [k for k in ready if k not in needs or k in confirmed]
+            for k in needs:
+                if k not in self._confirmed:
+                    self._confirm_waiting.setdefault(k, self._tree_warned_at[k])
+            self._take_confirmations()
+            ready = [k for k in ready if k not in needs or k in self._confirmed]
         if not ready:
             return
 
@@ -1531,6 +1567,7 @@ class OverleafSync:
                 continue
             try:
                 self._apply_tree_action(key, docs, local)
+                self._confirmed.discard(key)
                 done = True
             except Exception as e:
                 if type(e).__name__ == "AuthError":
@@ -2175,6 +2212,8 @@ def run_check(settings: dict, cookie: str) -> int:
     print(f"Folder   : {out_dir}  ({'exists' if out_dir.is_dir() else 'will be created'})")
     session = overleaf_cli.OverleafSession(cookie)
     boot = session.get_project_bootstrap(settings["project_id"])
+    text, _ = describe_cookie_expiry(COOKIE_EXPIRY)
+    print(f"Cookie   : {text}")
     print(f"Logged in: yes — project \"{boot.get('ol-projectName', '?')}\"")
     print(f"Protocol : OT migration stage {boot.get('ol-otMigrationStage', 'not announced')} (supported: 0)")
     ws = TrackingSocketIOClient(session, settings["project_id"])
@@ -2290,6 +2329,9 @@ def main(argv: list[str] | None = None):
             sys.exit(run_check(settings, session_cookie))
         except (overleaf_cli.AuthError, overleaf_cli.UnsupportedProtocol) as e:
             sys.exit(f"Error: {e}")
+    text, urgent = describe_cookie_expiry(COOKIE_EXPIRY)
+    if urgent:
+        print(f"Warning: the session cookie {text}.", flush=True)
     if args.listen:
         OverleafListener(
             project_id=settings["project_id"],

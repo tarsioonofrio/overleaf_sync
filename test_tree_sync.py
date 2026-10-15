@@ -284,3 +284,23 @@ def test_a_rename_in_overleaf_plus_a_local_move_is_not_resurrected(tmp_path, mon
     sync._docs["d1"] = {"content": A, "version": 1, "path": "old-name.tex"}
     sync._sync_all_docs(WS(), initial=False)
     assert not (tmp_path / "new-name.tex").exists() and not (tmp_path / "old-name.tex").exists()
+
+
+def test_one_touch_confirms_a_wipe_and_a_delete_waiting_together(env, tmp_path):
+    (tmp_path / "chapters" / "two.tex").unlink()                       # a delete waiting for confirmation
+    env.scan(10)
+    assert calls(env) == []
+    wipe = [("d1", A, "")]                                             # and an emptied file waiting too
+    env.clock[0] += 1
+    assert env._settled(wipe) == []
+    env.scan(2, 2)
+    (tmp_path / env.WIPE_SENTINEL).touch()
+    env.scan(10)                                                       # the tree scan takes the sentinel first…
+    assert calls(env) == [("delete_doc", "d2")]
+    released = []
+    for _ in range(12):                                                # …and the wipe still gets its confirmation
+        env.clock[0] += 1
+        released += env._settled(wipe)
+        if released:
+            break
+    assert released == wipe
