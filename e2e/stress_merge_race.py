@@ -1,6 +1,6 @@
 import os, random, sys, threading, time
 from pathlib import Path
-sys.path.insert(0,"/home/tarsio/repos/overleaf_sync")
+import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO)
 import tempfile
 from overleaf_sync import OverleafSync
 out=Path(tempfile.mkdtemp()); base="\n".join(f"line {i}" for i in range(200))

@@ -2,6 +2,16 @@
 
 Bidirectional live sync between Overleaf and an AI coding agent — without going through Git.
 
+## Repository layout
+
+| Path | What |
+|---|---|
+| `overleaf_sync.py` | the sync (`overleaf-sync` command) |
+| `overleaf_cli.py` | Overleaf web/realtime client it uses (also a small debugging CLI) |
+| `tests/` | unit tests: `pip install -e ".[test]" && pytest` |
+| `e2e/` | end-to-end scripts against a throw-away self-hosted Overleaf or a throw-away project (see `e2e/README.md`) |
+| `contrib/` | systemd user unit |
+
 ## The problem
 
 Overleaf's Git integration is painful when two beings are editing simultaneously (human-human, human-agent): every push risks a conflict, and pushing while someone is typing in the browser fails outright. The Git bridge was not designed for high-frequency, automated writes.
@@ -12,7 +22,7 @@ This project uses the Overleaf real-time collaboration protocol and speaks it di
 
 ## Status
 
-Early MVP. The core sync loop is fully working:
+Usable two-way sync with the safeguards below. It does:
 
 - reads the current document state from Overleaf
 - applies agent edits via `applyOtUpdate` (insert / delete ops)
@@ -42,7 +52,7 @@ overleaf-sync --check <project_id>   # also shows when the Firefox-saved session
 
 ## Live concurrent editing
 
-While a coauthor types, their ops are merged into the local file, never written over it (`test_concurrent_edits.py`):
+While a coauthor types, their ops are merged into the local file, never written over it (`tests/test_concurrent_edits.py`):
 
 - 🧾 State per doc: `content` = server doc + our in-flight op; the file = `content` + edits not pushed yet.
 - 📥 A coauthor's op is transformed (ShareJS text OT, `transform_x`) past our in-flight op and past the unpushed local edits, then applied to the file.
@@ -90,7 +100,7 @@ Tools that re-read the file at the moment of writing (e.g. targeted `Edit`/`str_
 
 ## Reconnect invariants (data-loss prevention)
 
-These invariants are enforced by the test suite in `test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
+These invariants are enforced by the test suite in `tests/test_sync_reconnect.py` (103 tests covering every combination of edits during a network outage).
 
 ### Scenario A — No edits during disconnection (idle outage)
 Both sides unchanged. **No-op.** Local file stays as-is.

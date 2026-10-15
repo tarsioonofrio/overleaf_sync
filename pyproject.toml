@@ -21,6 +21,6 @@ e2e = ["selenium"]
 py-modules = ["overleaf_sync", "overleaf_cli"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
-norecursedirs = ["e2e", ".git"]

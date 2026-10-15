@@ -1,6 +1,6 @@
 import json, os, subprocess, sys, time, shutil, threading, re, html
 from pathlib import Path
-sys.path.insert(0, "/home/tarsio/repos/overleaf_sync")
+import os as _os; REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))); sys.path.insert(0, REPO)
 os.environ["OVERLEAF_URL"]="http://127.0.0.1:18080"; os.environ["OVERLEAF_COOKIE_NAME"]="overleaf.sid"
 import requests
 from overleaf_cli import OverleafSession
@@ -31,7 +31,7 @@ class Remote:
 
 def start_sync(extra=()):
     f=open(LOG,"a")
-    return subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I","/home/tarsio/repos/overleaf_sync/overleaf_sync.py",PID,"--cookie",COOKIE,"--output-dir",str(OUT),*extra],stdout=f,stderr=f,env=os.environ)
+    return subprocess.Popen(["/tmp/olt/venv/bin/python","-u","-I",REPO+"/overleaf_sync.py",PID,"--cookie",COOKIE,"--output-dir",str(OUT),*extra],stdout=f,stderr=f,env=os.environ)
 def wait(cond,t=15):
     e=time.time()+t
     while time.time()<e:
