@@ -7,6 +7,7 @@ Bidirectional live sync between Overleaf and an AI coding agent — without goin
 | Path | What |
 |---|---|
 | `src/overleaf_sync/sync.py` | the file-sync daemon, `init`, and the `overleaf-sync` command |
+| `src/overleaf_sync/lsp.py` | the language server (`overleaf-sync-lsp`): open editor buffers sync live, no saving needed |
 | `src/overleaf_sync/ot.py` | pure text / operational-transformation helpers (diff, apply, transform, 3-way merge) |
 | `src/overleaf_sync/client.py` | Overleaf web and real-time client (also a small debugging CLI: `python -m overleaf_sync.client`) |
 | `tests/` | unit tests: `pip install -e ".[test]" && pytest` |
@@ -59,6 +60,23 @@ overleaf-sync --check <project_id>   # also shows when the Firefox-saved session
 ```
 
 `contrib/overleaf-sync@.service` is a systemd *user* unit (one instance per project; the cookie goes in a `chmod 600` env file, see the comments in the file). Tests run on Python 3.11–3.14 in CI (`.github/workflows/test.yml`).
+
+## Language server (live editing without saving)
+
+`overleaf-sync-lsp` (or `overleaf-sync lsp`) is a language server over stdio. It is the same sync engine running inside your editor: a document that is **open in the editor** is read from the editor's buffer as you type (full-text `didChange`), and a coauthor's edits arrive in the buffer through `workspace/applyEdit`, so nothing has to be saved for Overleaf to see your typing, and the file on disk is not rewritten under you. Documents that are not open keep syncing through their files, so agents and other tools still see an up-to-date folder. Run `overleaf-sync init <url>` in the folder first (the server finds `.overleaf-sync.toml` from the workspace root upward); don't run the plain `overleaf-sync` daemon on the same folder at the same time (the lock refuses it).
+
+```lua
+-- Neovim
+vim.lsp.start({ name = "overleaf", cmd = { "overleaf-sync-lsp" }, root_dir = vim.fs.root(0, ".overleaf-sync.toml") })
+```
+
+Commands (`workspace/executeCommand`): `overleaf.status`, `overleaf.confirm` (the `touch` confirmation for an emptied file or a deletion), `overleaf.reloadDocument` (see below).
+
+What to know:
+- **Remote text never gets pushed back.** While an edit is on its way to the editor the engine uses the text it promised the editor, merges what you typed meanwhile (3-way), and only goes on after the editor reports the new version. If the editor keeps refusing the edit (stale version) or never reports it, the document is marked *diverged*: nothing more is sent for it, you get a message, and `overleaf.reloadDocument` puts Overleaf's text in the buffer (yours is saved under `.overleaf-sync-backup/` first).
+- **Client requirements:** full-text sync, `workspace/applyEdit` that honours `textDocument.version` and answers `applied` truthfully, and a `didChange` for every change including the ones applyEdit makes. Tested against a spec-following simulated editor (unit tests with randomised interleavings, and against overleaf.com); real editors differ, so try it on a throw-away project first.
+- Closing a document writes its last text to the file; text you never saved but that already reached Overleaf is therefore kept, not reverted.
+- When several people insert at exactly the same spot, the OT merge can interleave their text and, rarely, split a typed token in two; no characters are lost.
 
 ## Live concurrent editing
 

@@ -227,7 +227,7 @@ class LspSync(_sync.OverleafSync):
         rel = self._rel(path) if path else None
         with self._olock:
             od = self._open.get(rel)
-            if od is None:
+            if od is None or version <= od.version:        # versions only grow: a late or repeated report is stale
                 return
             od.text, od.version = text, version
             p = od.pending

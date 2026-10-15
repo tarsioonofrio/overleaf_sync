@@ -207,6 +207,13 @@ def test_closing_writes_the_last_text_to_the_file_and_hands_over_to_the_poller(e
     assert pushes(env) == []
 
 
+def test_a_stale_or_repeated_didchange_is_ignored(env):
+    env.type(0, "NEW ")
+    env.sync_.did_change(env.uri, BASE, env.version - 1)          # an older report arriving late
+    env.sync_.did_change(env.uri, "something else", env.version)   # the same version again
+    assert env.sync_._open["main.tex"].text == "NEW " + BASE
+
+
 def test_documents_that_are_not_open_still_use_the_file(env, tmp_path):
     env.sync_.did_close(env.uri)
     (tmp_path / "main.tex").write_text(BASE + "from disk\n")
