@@ -233,10 +233,11 @@ def frame(msg):
     return b"Content-Length: %d\r\n\r\n" % len(b) + b
 
 
-def run_session(messages):
+def run_session(messages, real_start=False):
     out = io.BytesIO()
     srv = Server(io.BytesIO(b"".join(frame(m) for m in messages)), out)
-    srv.start_sync = lambda: None
+    if not real_start:
+        srv.start_sync = lambda: None
     code = srv.serve()
     replies, data = [], out.getvalue()
     while data:
@@ -347,3 +348,15 @@ def test_random_interleavings_lose_nothing_and_revert_nothing(tmp_path, monkeypa
     assert ed.text == final_server, (seed, lazy)
     for tok in remote_toks + typed_toks:
         assert ed.text.count(tok) == 1 and final_server.count(tok) == 1, (seed, lazy, tok)
+
+
+def test_a_folder_without_config_gets_a_message_telling_how_to_init(tmp_path):
+    code, replies = run_session([
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": tmp_path.as_uri()}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"},
+    ], real_start=True)
+    shown = [r for r in replies if r.get("method") == "window/showMessage"]
+    assert shown and shown[0]["params"]["type"] == 1 and "overleaf-sync init" in shown[0]["params"]["message"]
+    assert code == 0
