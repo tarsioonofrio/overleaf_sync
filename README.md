@@ -34,9 +34,18 @@ Files created, renamed, moved or deleted on disk are mirrored in the project (se
 ## Usage
 
 ```bash
-pip install -r requirements.txt
+pip install .              # or pipx install .  → provides `overleaf-sync`
 
-python3 overleaf_sync.py <project_id>
+cd ~/papers/thesis         # the folder that will hold the project
+overleaf-sync init https://www.overleaf.com/project/<id>
+```
+
+`init` sets up **the folder you are in** (or `--dir`): it reads your login from Firefox (or `--cookie-file`), checks the project, shows which documents exist, asks for confirmation, writes `.overleaf-sync.toml` there (project id and instance only — never the cookie), adds the tool's own files to `.gitignore` if the folder is a git checkout, and offers to start syncing. After that, `overleaf-sync` with no arguments, from that folder or any subfolder, syncs it. `init -y --no-start` skips the questions for scripts. Works for self-hosted instances too: use the project URL of your server.
+
+Without `init`:
+
+```bash
+overleaf-sync <project_id> --output-dir ./thesis
 ```
 
 Get `overleaf_session2` from your browser cookies while logged in to overleaf.com. Get `project_id` from the URL (`/project/<id>`).

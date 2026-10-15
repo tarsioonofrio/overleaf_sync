@@ -2199,7 +2199,7 @@ def load_config(path: str | None) -> tuple[dict, Path | None]:
     """Read the TOML config (explicit path, ./.overleaf-sync.toml, or the user config)."""
     import tomllib
     candidates = [Path(path).expanduser()] if path else [
-        Path.cwd() / ".overleaf-sync.toml",
+        *(d / ".overleaf-sync.toml" for d in (Path.cwd(), *Path.cwd().parents)),   # like git: nearest parent wins
         Path.home() / ".config" / "overleaf-sync" / "config.toml",
     ]
     for p in candidates:
@@ -2215,7 +2215,7 @@ def load_config(path: str | None) -> tuple[dict, Path | None]:
     return {}, None
 
 
-def resolve_settings(args, cfg: dict) -> dict:
+def resolve_settings(args, cfg: dict, cfg_path: Path | None = None) -> dict:
     """Merge flags > project profile > top-level config; pick the project."""
     projects = cfg.get("projects", {})
     target = args.project_id
@@ -2229,12 +2229,17 @@ def resolve_settings(args, cfg: dict) -> dict:
         else:
             sys.exit("Error: several projects in the config; name one: " + ", ".join(sorted(projects)))
     project_id = profile.get("project_id") or (target if target not in projects else None)
+    config_dir = None
+    if project_id is None and cfg.get("project_id"):
+        project_id = cfg["project_id"]                      # written by `overleaf-sync init`
+        config_dir = cfg_path.parent if cfg_path else None  # the folder it lives in is the synced folder
     if project_id is None:
         project_id = project_from_git_remote()
     if not re.fullmatch(r"[0-9a-f]{24}", project_id or ""):
         sys.exit(f"Error: {project_id!r} is not an Overleaf project id (24 hex characters, from the project URL)")
     pick = lambda key: profile.get(key, cfg.get(key))
-    output_dir = args.output_dir or pick("output_dir") or os.path.join(os.getcwd(), name or project_id)
+    output_dir = args.output_dir or pick("output_dir") or (
+        config_dir if config_dir is not None else os.path.join(os.getcwd(), name or project_id))
     return {
         "project_id": project_id,
         "name": name,
@@ -2311,13 +2316,160 @@ def run_check(settings: dict, cookie: str) -> int:
         ws.disconnect()
 
 
+# ---------------------------------------------------------------------------
+# `overleaf-sync init`
+# ---------------------------------------------------------------------------
+
+DEFAULT_HOSTS = ("www.overleaf.com", "overleaf.com")
+GITIGNORE_LINES = (".overleaf-sync-backup/", ".overleaf-sync-base/", ".overleaf-sync.lock", ".overleaf-sync-confirm-wipe")
+
+
+def parse_project_ref(ref: str) -> tuple[str, str | None]:
+    """(project id, instance URL or None for overleaf.com) from a project URL, git URL or bare id."""
+    ref = ref.strip()
+    if re.fullmatch(r"[0-9a-f]{24}", ref):
+        return ref, None
+    u = urlparse(ref if "://" in ref else "https://" + ref)
+    m = re.search(r"/(?:project/)?([0-9a-f]{24})(?:/|$)", u.path)
+    if not m or not u.hostname:
+        raise ValueError(f"{ref!r} is not an Overleaf project URL or id (the id is the 24 hex characters in the URL)")
+    if u.hostname in DEFAULT_HOSTS or u.hostname == "git.overleaf.com":
+        return m.group(1), None
+    return m.group(1), f"{u.scheme}://{u.netloc}"
+
+
+def render_config(project_id: str, url: str | None, cookie_name: str | None, cookie_file: str | None) -> str:
+    lines = ["# Written by `overleaf-sync init`. This folder is the synced folder; run `overleaf-sync` here.",
+             f'project_id = "{project_id}"']
+    if url:
+        lines.append(f'url = "{url}"')
+    if cookie_name:
+        lines.append(f'cookie_name = "{cookie_name}"')
+    if cookie_file:
+        lines.append(f'cookie_file = "{cookie_file}"')
+    lines.append("# prune_backups_days = 30   # uncomment to delete backup runs older than this")
+    return "\n".join(lines) + "\n"
+
+
+def ensure_gitignore(folder: Path) -> list[str]:
+    """If the folder is a git checkout, keep the tool's own files out of it; returns the lines added."""
+    if not (folder / ".git").exists():
+        return []
+    gi = folder / ".gitignore"
+    have = set(gi.read_text(encoding="utf-8").splitlines()) if gi.exists() else set()
+    add = [l for l in GITIGNORE_LINES if l not in have]
+    if add:
+        with open(gi, "a", encoding="utf-8") as f:
+            if have and not gi.read_text(encoding="utf-8").endswith("\n"):
+                f.write("\n")
+            f.write("\n".join(add) + "\n")
+    return add
+
+
+def _ask(question: str, default: bool, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        sys.exit(f"Error: '{question}' needs an answer; run in a terminal or pass --yes / --start / --no-start.")
+    answer = input(f"{question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    return default if not answer else answer.startswith("y")
+
+
+def run_init(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="overleaf-sync init",
+        description="Set up the CURRENT folder (or --dir) as the local copy of an Overleaf project: "
+                    "checks the login, writes .overleaf-sync.toml here, and offers to start syncing.",
+        epilog="examples:\n  cd ~/papers/thesis && overleaf-sync init https://www.overleaf.com/project/69a0...\n"
+               "  overleaf-sync init 69a0... --dir ~/papers/thesis --yes --no-start",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("project", nargs="?", help="project URL (or id); asked for if omitted")
+    parser.add_argument("--dir", default=None, help="folder to set up (default: the current directory)")
+    parser.add_argument("--url", default=None, help="Overleaf instance (default: taken from the project URL)")
+    parser.add_argument("--cookie-name", default=None)
+    parser.add_argument("--cookie", default=None, help="session cookie value (visible in ps; prefer --cookie-file)")
+    parser.add_argument("--cookie-file", default=None, help="file holding the session cookie value (saved in the config)")
+    parser.add_argument("--firefox-profile", default=None)
+    parser.add_argument("--cookie-db", default=None)
+    parser.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    parser.add_argument("--start", dest="start", action="store_true", default=None, help="start syncing when done")
+    parser.add_argument("--no-start", dest="start", action="store_false", help="only set up, do not start")
+    parser.add_argument("--force", action="store_true", help="overwrite an existing .overleaf-sync.toml")
+    args = parser.parse_args(argv)
+
+    folder = Path(args.dir).expanduser().resolve() if args.dir else Path.cwd()
+    cfg_file = folder / ".overleaf-sync.toml"
+    ref = args.project
+    if not ref:
+        if not sys.stdin.isatty():
+            sys.exit("Error: give the project URL or id: overleaf-sync init <url>")
+        ref = input("Overleaf project URL or id: ")
+    try:
+        project_id, url_from_ref = parse_project_ref(ref)
+    except ValueError as e:
+        sys.exit(f"Error: {e}")
+    url = args.url or url_from_ref
+    if cfg_file.exists() and not args.force:
+        sys.exit(f"Error: {cfg_file} already exists. Run `overleaf-sync` in {folder} to use it, or pass --force to replace it.")
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import overleaf_cli
+    overleaf_cli.configure(url, args.cookie_name)
+    cookie = args.cookie or (read_cookie_file(args.cookie_file) if args.cookie_file else None)
+    print(f"Folder   : {folder}")
+    try:
+        session_cookie = load_overleaf_cookie(explicit_cookie=cookie, firefox_profile=args.firefox_profile,
+                                              cookie_db=args.cookie_db)
+    except SystemExit:
+        print("\nTo give the tool your login: sign in to Overleaf in Firefox (it is read from there), or copy the\n"
+              f"'{overleaf_cli.COOKIE_NAME}' cookie value from your browser's developer tools into a file and run\n"
+              "  overleaf-sync init <url> --cookie-file <file>", file=sys.stderr)
+        raise
+    settings = {"project_id": project_id, "output_dir": str(folder)}
+    try:
+        rc = run_check(settings, session_cookie)
+    except Exception as e:                      # AuthError, RateLimited, UnsupportedProtocol, network
+        sys.exit(f"Error: {e}")
+    if rc != 0:
+        sys.exit(rc)
+    existing = [p for p in folder.rglob("*") if p.is_file() and not any(part.startswith(".") for part in p.relative_to(folder).parts)] if folder.is_dir() else []
+    if existing:
+        print(f"\nThis folder already has {len(existing)} file(s). Overleaf's version wins for text documents that "
+              f"differ; the local copy is kept in .overleaf-sync-backup/ and edits made locally are merged "
+              f"(see the README).")
+    if not _ask("\nSet this folder up as the local copy of this project?", True, args.yes):
+        sys.exit("Nothing was written.")
+    folder.mkdir(parents=True, exist_ok=True)
+    cookie_file = str(Path(args.cookie_file).expanduser().resolve()) if args.cookie_file else None
+    cfg_file.write_text(render_config(project_id, url, args.cookie_name, cookie_file), encoding="utf-8")
+    print(f"Wrote {cfg_file}")
+    added = ensure_gitignore(folder)
+    if added:
+        print(f"Added to .gitignore: {', '.join(added)}")
+    start = args.start if args.start is not None else (False if args.yes else _ask("Start syncing now?", True, False))
+    if start:
+        print()
+        if args.cookie:
+            os.environ["OVERLEAF_COOKIE"] = args.cookie      # not on the command line, where ps would show it
+        main(["--config", str(cfg_file)])
+        return
+    print(f"\nDone. Next:\n  cd {shlex.quote(str(folder))}\n  overleaf-sync --dry-run   # first look: pulls, sends nothing\n"
+          f"  overleaf-sync             # start syncing (Ctrl-C to stop)\n"
+          f"To keep it running in the background see contrib/overleaf-sync@.service.")
+
+
 def main(argv: list[str] | None = None):
+    args_list = sys.argv[1:] if argv is None else argv
+    if args_list and args_list[0] == "init":
+        return run_init(args_list[1:])
     parser = argparse.ArgumentParser(
         prog="overleaf-sync",
         description="Live two-way sync between an Overleaf project and a local folder.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
+              overleaf-sync init <project URL>                     # set up the current folder, then sync
+              overleaf-sync                                        # inside a folder set up by init
               overleaf-sync 69a0589216d96e98bc76b8c6 --dry-run     # first look, sends nothing
               overleaf-sync 69a0589216d96e98bc76b8c6 --check       # diagnostics only
               overleaf-sync paper                                  # profile from the config file
@@ -2362,7 +2514,7 @@ def main(argv: list[str] | None = None):
 
     args = parser.parse_args(argv)
     cfg, cfg_path = load_config(args.config)
-    settings = resolve_settings(args, cfg)
+    settings = resolve_settings(args, cfg, cfg_path)
 
     sys.path.insert(0, str(Path(__file__).parent))
     import overleaf_cli
